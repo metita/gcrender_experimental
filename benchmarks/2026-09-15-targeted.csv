@@ -1,0 +1,24 @@
+path,metric,value,unit,notes
+r_studio_savebones_2,stock_call,0.637,us,representative late validation sample
+r_studio_savebones_2,validation_plus_fast_segment,1.364,us,mode 2 intentionally performs extra work
+r_studio_savebones_2,validated_calls,9031680,calls,representative cumulative sample
+r_studio_savebones_2,mismatches,0,count,validation remained exact in the sampled run
+r_studio_texcache,first_pass_hits,1055,textures,representative persistent-cache load
+r_studio_texcache,first_pass_misses,4021,textures,representative persistent-cache load
+r_studio_texcache,second_pass_hits,5076,textures,next matching load
+r_studio_texcache,second_pass_misses,0,textures,next matching load
+r_studio_texcompress,compressed,5076,textures,representative load with mode 2
+r_studio_texmips,forced_mips,545,textures,representative load
+r_studio_texture,uploads,14634,textures,representative load
+r_tracer_vbo,dedicated_off_renderer,0.566,ms,earlier dedicated workload
+r_tracer_vbo,dedicated_initial_on_renderer,1.148,ms,earlier dedicated workload
+r_tracer_vbo,dedicated_later_on_renderer,0.637,ms,later optimized implementation sample
+r_tracer_vbo,dedicated_captures,23273,captures,earlier dedicated workload
+r_tracer_vbo,dedicated_vertices,93092,vertices,earlier dedicated workload
+r_tracer_vbo,dedicated_uploads,311,uploads,earlier dedicated workload
+r_tracer_vbo,dedicated_fallbacks,0,count,earlier dedicated workload
+r_sprite_vbo,dedicated_off_renderer,1.472,ms,controlled visual A/B workload
+r_sprite_vbo,dedicated_on_renderer,1.663,ms,controlled visual A/B workload
+r_sprite_vbo,changed_pixels,0,pixels,controlled visual A/B workload
+r_studio_posecache,representative_hit_rate,17.7,percent,3634 hits from 20480 lookups
+r_studio_posecache,longer_hit_rate,15.6,percent,43416 hits from 278528 lookups
