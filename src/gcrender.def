@@ -1,0 +1,6 @@
+LIBRARY gcrender
+EXPORTS
+    RIB_Main
+    ASI_startup
+    ASI_shutdown
+    ASI_error

@@ -1,0 +1,6 @@
+/build/
+/_audit_tmp/
+/_runtime_test/
+*.log
+*.pdb
+*.ilk
