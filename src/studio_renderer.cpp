@@ -7938,7 +7938,7 @@ bool Install(HMODULE client, HMODULE hw, cl_enginefunc_t* engine)
     {
         g_mode = engine->pfnRegisterVariable("r_studio_renderer", "1", 0);
         g_nonPlayerMode =
-            engine->pfnRegisterVariable("r_studio_nonplayer", "0", 0);
+            engine->pfnRegisterVariable("r_studio_nonplayer", "1", 0);
         g_meshoptMode =
             engine->pfnRegisterVariable("r_meshoptimizer", "1", 0);
         g_instancingMode =
@@ -7967,7 +7967,7 @@ bool Install(HMODULE client, HMODULE hw, cl_enginefunc_t* engine)
 
     rendererlog::Line(
         "studio renderer: whole-model retained cache ready "
-        "(r_studio_renderer default 1, r_studio_nonplayer default 0, "
+        "(r_studio_renderer default 1, r_studio_nonplayer default 1, "
         "r_meshoptimizer default 1, r_studio_instancing default 0)");
     return true;
 }
