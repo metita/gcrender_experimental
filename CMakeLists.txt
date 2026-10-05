@@ -31,6 +31,7 @@ add_library(gcrender SHARED
     src/particle_vbo.cpp
     src/beam_vbo.cpp
     src/sprite_vbo.cpp
+    src/module_range.cpp
     src/inline_hook.cpp
     src/log.cpp
     src/gcrender.def)

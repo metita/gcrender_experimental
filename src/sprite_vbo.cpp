@@ -2,6 +2,7 @@
 
 #include "hw_build.h"
 #include "log.h"
+#include "module_range.h"
 #include "perf_control.h"
 #include "world_vbo.h"
 
@@ -21,6 +22,7 @@ constexpr std::uintptr_t kCurrentEntityRva          = 0x0078F470u;
 constexpr std::uintptr_t kSpriteTextureMatrixRva    = 0x0078F944u;
 constexpr std::uintptr_t kSpriteBlendRva            = 0x0333A008u;
 constexpr std::uintptr_t kGoldBindRva               = 0x00064D40u;
+constexpr std::uintptr_t kGoldCurrentTmuRva         = 0x027E35E0u;
 constexpr std::uintptr_t kSpriteBindCallRva         = 0x0006FCD4u;
 constexpr std::uintptr_t kSpriteColorCallRva        = 0x0006FB7Du;
 constexpr std::uintptr_t kSpriteBeginCallRva        = 0x0006FD56u;
@@ -167,12 +169,24 @@ struct DirectPatch
 
 std::uint8_t* g_hwBase = nullptr;
 cl_enginefunc_t* g_engine = nullptr;
-HMODULE g_selfModule = nullptr;
 cvar_t* g_cvar = nullptr;
 bool g_installed = false;
 bool g_enabled = false;
 bool g_collectStats = false;
 int g_solidPassDepth = 0;
+
+// qgl slots only change at frame boundaries (module UpdateFrame, context
+// recreation) or through Studio's RefreshQglHooks, which installs wrappers
+// from this module.  One validation per solid pass is therefore exact.
+bool g_passSlotsValid = false;
+std::uint64_t g_passSlotMask = 0;
+
+// Gold's cached TMU when the current R_DrawSpriteModel was entered.
+bool g_entryTmuZero = false;
+
+// GL_MAX_TEXTURE_UNITS is a context constant.
+int g_textureUnits = 0;
+std::uint32_t g_textureUnitsGeneration = 0;
 
 GoldBindFn g_goldBind = nullptr;
 GlBeginFn g_begin = nullptr;
@@ -395,13 +409,7 @@ std::uint64_t SlotMismatchMask()
 {
     std::uint64_t mask = 0;
     const auto selfOrExpected = [](const void* live, const void* expected) {
-        if (live == expected)
-            return true;
-        if (!live || !g_selfModule)
-            return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        return VirtualQuery(live, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-               mbi.AllocationBase == g_selfModule;
+        return modulerange::SelfOrExpected(live, expected);
     };
 #define SPRITE_SLOT_CHECK(bit, type, rva, expected) \
     do { if (ReadQgl<type>(rva) != (expected)) mask |= (1ull << (bit)); } while (0)
@@ -442,9 +450,27 @@ std::uint64_t SlotMismatchMask()
     return mask;
 }
 
+std::uint64_t PassSlotMismatchMask()
+{
+    if (g_solidPassDepth <= 0)
+        return SlotMismatchMask();
+    if (!g_passSlotsValid)
+    {
+        g_passSlotMask = SlotMismatchMask();
+        g_passSlotsValid = true;
+    }
+    return g_passSlotMask;
+}
+
 bool SlotsStable()
 {
-    return SlotMismatchMask() == 0;
+    return PassSlotMismatchMask() == 0;
+}
+
+void InvalidatePassCache()
+{
+    g_passSlotsValid = false;
+    g_passSlotMask = 0;
 }
 
 void ForgetBuffers(bool deleteBuffers)
@@ -493,7 +519,22 @@ bool EnsureBuffers()
     return true;
 }
 
-bool ForeignArraysClear()
+int TextureUnits()
+{
+    const std::uint32_t generation = worldvbo::ContextGeneration();
+    if (g_textureUnits == 0 || g_textureUnitsGeneration != generation)
+    {
+        int units = 0;
+        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &units);
+        g_textureUnits = units;
+        g_textureUnitsGeneration = generation;
+    }
+    return g_textureUnits;
+}
+
+// Immediate mode ignores client arrays, only the streamed glDrawArrays
+// consumes them.  Checked once per flush, right before that draw.
+bool ForeignArraysClear(int previousClient)
 {
     if (g_isEnabled(GL_NORMAL_ARRAY) || g_isEnabled(GL_INDEX_ARRAY) ||
         g_isEnabled(GL_EDGE_FLAG_ARRAY) ||
@@ -501,10 +542,7 @@ bool ForeignArraysClear()
         g_isEnabled(GL_SECONDARY_COLOR_ARRAY))
         return false;
 
-    int previousClient = static_cast<int>(GL_TEXTURE0);
-    int units = 0;
-    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClient);
-    g_getIntegerv(GL_MAX_TEXTURE_UNITS, &units);
+    const int units = TextureUnits();
     if (units < 1 || units > 32)
         return false;
     for (int unit = 1; unit < units; ++unit)
@@ -522,25 +560,33 @@ bool ForeignArraysClear()
 
 bool GeometryStateReady()
 {
+    // Stock solid R_DrawSpriteModel (hw+0x6FA60, rendermode 0, blend cvar 0)
+    // issues TexEnvi(MODULATE) on the entry TMU, Disable(GL_BLEND),
+    // GL_Bind(0, frame) and Enable(GL_ALPHA_TEST) right before this qglBegin,
+    // so blend and alpha test are known here.  The remaining state is
+    // inherited from whatever was drawn before this sprite and is queried.
     int activeTexture = 0;
-    int program = 0;
-    int depthMask = 0;
-    int texEnv = 0;
-    int arrayBuffer = 0;
     g_getIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+    if (activeTexture != static_cast<int>(GL_TEXTURE0))
+        return false;
+    int program = 0;
     g_getIntegerv(GL_CURRENT_PROGRAM, &program);
+    if (program != 0)
+        return false;
+    int depthMask = 0;
     g_getIntegerv(GL_DEPTH_WRITEMASK, &depthMask);
-    g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &arrayBuffer);
-    g_getTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &texEnv);
+    if (depthMask == 0 || !g_isEnabled(GL_TEXTURE_2D) ||
+        !g_isEnabled(GL_DEPTH_TEST))
+        return false;
 
-    return activeTexture == static_cast<int>(GL_TEXTURE0) &&
-           program == 0 && depthMask != 0 && arrayBuffer == 0 &&
-           texEnv == static_cast<int>(GL_MODULATE) &&
-           g_isEnabled(GL_TEXTURE_2D) &&
-           g_isEnabled(GL_DEPTH_TEST) &&
-           g_isEnabled(GL_ALPHA_TEST) &&
-           !g_isEnabled(GL_BLEND) &&
-           ForeignArraysClear();
+    // Gold's SelectTexture only calls glActiveTexture when its cached TMU
+    // differs.  A cached TMU of 0 at entry plus a live unit 0 here means the
+    // stock TexEnvi above already targeted unit 0.
+    if (g_entryTmuZero)
+        return true;
+    int texEnv = 0;
+    g_getTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &texEnv);
+    return texEnv == static_cast<int>(GL_MODULATE);
 }
 
 bool CaptureReady()
@@ -641,7 +687,7 @@ void PrepareSpriteDrawState()
     g_depthMask(1);
 }
 
-bool GrowBuffers(std::size_t bytes, int previousBuffer)
+bool GrowBuffers(std::size_t bytes)
 {
     if (bytes <= g_vboCapacity)
         return true;
@@ -651,16 +697,8 @@ bool GrowBuffers(std::size_t bytes, int previousBuffer)
         capacity <<= 1;
     if (capacity < bytes)
         return false;
-
-    for (const unsigned id : g_vbos)
-    {
-        g_bindBuffer(GL_ARRAY_BUFFER, id);
-        g_bufferData(GL_ARRAY_BUFFER,
-                     static_cast<std::ptrdiff_t>(capacity),
-                     nullptr, GL_STREAM_DRAW);
-    }
+    // Every upload respecifies its buffer with the current capacity.
     g_vboCapacity = capacity;
-    g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previousBuffer));
     return true;
 }
 
@@ -675,8 +713,20 @@ bool DrawPending()
     if (!CaptureServerState(state))
         return false;
 
+    // Gold's sprite path owns no VBO.  If another renderer/mod has one bound
+    // or left foreign arrays enabled, replay the stock immediate stream.
+    if (state.arrayBuffer != 0 || !ForeignArraysClear(state.clientTexture))
+    {
+        if (g_collectStats)
+        {
+            ++g_stats.fallbacks;
+            ++g_stats.stateFallbacks;
+        }
+        return false;
+    }
+
     const std::size_t bytes = g_vertices.size() * sizeof(SpriteVertex);
-    if (!GrowBuffers(bytes, state.arrayBuffer))
+    if (!GrowBuffers(bytes))
         return false;
 
     bool pushed = false;
@@ -694,6 +744,11 @@ bool DrawPending()
         g_disableClientState(GL_FOG_COORDINATE_ARRAY);
         g_disableClientState(GL_SECONDARY_COLOR_ARRAY);
         g_bindBuffer(GL_ARRAY_BUFFER, vbo);
+        // Orphan before the upload so a buffer still read by an earlier flush
+        // never stalls the subdata write.
+        g_bufferData(GL_ARRAY_BUFFER,
+                     static_cast<std::ptrdiff_t>(g_vboCapacity),
+                     nullptr, GL_STREAM_DRAW);
         g_bufferSubData(GL_ARRAY_BUFFER, 0,
                         static_cast<std::ptrdiff_t>(bytes),
                         g_vertices.data());
@@ -993,10 +1048,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
 
     g_hwBase = reinterpret_cast<std::uint8_t*>(hw);
     g_engine = engine;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&Install), &g_selfModule);
+    modulerange::Init();
     if (!LoadFunctions())
     {
         rendererlog::Line("spritevbo: required GL entrypoints unavailable");
@@ -1077,6 +1129,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
 void UpdateFrame()
 {
     g_enabled = false;
+    InvalidatePassCache();
     if (!g_installed || !g_cvar)
         return;
     __try
@@ -1091,8 +1144,12 @@ void UpdateFrame()
 
 void BeginSolidPass()
 {
-    if (g_solidPassDepth == 0 && !g_vertices.empty())
-        Flush();
+    if (g_solidPassDepth == 0)
+    {
+        if (!g_vertices.empty())
+            Flush();
+        InvalidatePassCache();
+    }
     ++g_solidPassDepth;
 }
 
@@ -1104,7 +1161,10 @@ void EndSolidPass()
         return;
     }
     if (g_solidPassDepth == 1)
+    {
         Flush();
+        InvalidatePassCache();
+    }
     --g_solidPassDepth;
 }
 
@@ -1117,6 +1177,7 @@ bool BeginCurrentSolidSprite()
     g_currentReady = false;
     g_sawTextureBind = false;
     g_sawColor = false;
+    g_entryTmuZero = false;
     g_currentTexture = 0;
     g_currentVertexCount = 0;
 
@@ -1130,7 +1191,7 @@ bool BeginCurrentSolidSprite()
         }
         return false;
     }
-    const std::uint64_t slotMismatch = SlotMismatchMask();
+    const std::uint64_t slotMismatch = PassSlotMismatchMask();
     if (slotMismatch != 0)
     {
         if (g_collectStats)
@@ -1192,6 +1253,9 @@ bool BeginCurrentSolidSprite()
 
         // The exact color is captured from Gold's qglColor4ub call.  This keeps
         // Gold's optional color-correction helper authoritative.
+
+        g_entryTmuZero = *reinterpret_cast<const int*>(
+            g_hwBase + kGoldCurrentTmuRva) == 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {

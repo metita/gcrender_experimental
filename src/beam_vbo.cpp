@@ -2,6 +2,7 @@
 
 #include "hw_build.h"
 #include "log.h"
+#include "module_range.h"
 #include "perf_control.h"
 #include "world_vbo.h"
 
@@ -179,7 +180,6 @@ struct CallPatch
 };
 
 std::uint8_t* g_hwBase = nullptr;
-HMODULE g_selfModule = nullptr;
 cvar_t* g_cvar = nullptr;
 cvar_t* g_tracerCvar = nullptr;
 bool g_installed = false;
@@ -190,6 +190,22 @@ bool g_armBegin = false;
 bool g_capture = false;
 bool g_collectStats = false;
 bool g_lastArrayReject = false;
+
+// qgl/TriAPI slots only change at frame boundaries (module UpdateFrame,
+// context recreation) or through wrappers installed by this module, so the
+// slot verdict is computed once and dropped at every pass barrier and frame.
+bool g_slotCacheValid = false;
+bool g_slotCacheStable = false;
+
+// Beam current color/texcoord are resolved lazily.  Every exact R_DrawSegs
+// vertex is preceded by Brightness and TexCoord, so the stock Begin-time
+// glGetFloatv pair is only needed if that ever stops being true.
+bool g_beamColorKnown = false;
+bool g_beamTexKnown = false;
+
+// GL_MAX_TEXTURE_UNITS is a context constant.
+int g_textureUnits = 0;
+std::uint32_t g_textureUnitsGeneration = 0;
 
 enum class CaptureKind : std::uint8_t
 {
@@ -416,16 +432,10 @@ bool LoadFunctions()
 
 bool SelfOrExpected(const void* live, const void* expected)
 {
-    if (live == expected)
-        return true;
-    if (!live || !g_selfModule)
-        return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    return VirtualQuery(live, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-           mbi.AllocationBase == g_selfModule;
+    return modulerange::SelfOrExpected(live, expected);
 }
 
-bool SlotsStable()
+bool ComputeSlotsStable()
 {
     // TriangleAPI slots themselves must remain exact. If an external TriAPI
     // provider replaces one, preserve it by using stock passthrough.
@@ -491,6 +501,22 @@ bool SlotsStable()
            ReadPtr<GlBufferDataFn>(kQglBufferDataRva) == g_bufferData;
 }
 
+bool SlotsStable()
+{
+    if (!g_slotCacheValid)
+    {
+        g_slotCacheStable = ComputeSlotsStable();
+        g_slotCacheValid = true;
+    }
+    return g_slotCacheStable;
+}
+
+void InvalidateSlotCache()
+{
+    g_slotCacheValid = false;
+    g_slotCacheStable = false;
+}
+
 bool TracerSlotsStable()
 {
     // Tracer capture suppresses these exact TriangleAPI calls. Any foreign
@@ -554,7 +580,20 @@ bool EnsureBuffers()
     return true;
 }
 
-bool ForeignArraysClear()
+int TextureUnits()
+{
+    const std::uint32_t generation = worldvbo::ContextGeneration();
+    if (g_textureUnits == 0 || g_textureUnitsGeneration != generation)
+    {
+        int units = 0;
+        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &units);
+        g_textureUnits = units;
+        g_textureUnitsGeneration = generation;
+    }
+    return g_textureUnits;
+}
+
+bool ForeignArraysClear(int previousClientTexture)
 {
     g_lastArrayReject = false;
     if (g_isEnabled(GL_NORMAL_ARRAY) || g_isEnabled(GL_INDEX_ARRAY) ||
@@ -566,10 +605,7 @@ bool ForeignArraysClear()
         return false;
     }
 
-    int previousClientTexture = static_cast<int>(GL_TEXTURE0);
-    int maxTextureUnits = 0;
-    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
-    g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
+    const int maxTextureUnits = TextureUnits();
     if (maxTextureUnits < 1 || maxTextureUnits > 32)
     {
         g_lastArrayReject = true;
@@ -592,15 +628,14 @@ bool ForeignArraysClear()
 
 bool CaptureReady(CaptureKind kind)
 {
+    g_lastArrayReject = false;
     if (kind == CaptureKind::None || !rendererperf::Enabled())
         return false;
     const bool slotsStable =
         kind == CaptureKind::Tracer ? TracerSlotsStable() : SlotsStable();
-    if (!slotsStable || !EnsureBuffers() || !ForeignArraysClear())
-        return false;
-    int arrayBuffer = 0;
-    g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &arrayBuffer);
-    return arrayBuffer == 0;
+    // Immediate mode ignores client arrays and the array buffer binding.  Only
+    // the streamed draw consumes them, so beam batches check both at flush.
+    return slotsStable && EnsureBuffers();
 }
 
 void ResetTracerPass()
@@ -631,7 +666,9 @@ bool ValidateTracerPassOnce()
         g_tracerPassReject = TracerPassReject::Buffer;
         return false;
     }
-    if (!ForeignArraysClear())
+    int clientTexture = static_cast<int>(GL_TEXTURE0);
+    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &clientTexture);
+    if (!ForeignArraysClear(clientTexture))
     {
         g_tracerPassReject = TracerPassReject::Arrays;
         return false;
@@ -653,6 +690,23 @@ void AppendVertex(const float* xyz)
 {
     if (!xyz)
         return;
+    if (g_captureKind == CaptureKind::Beam &&
+        (!g_beamColorKnown || !g_beamTexKnown))
+    {
+        // Nothing reached GL since the suppressed Begin, the live current
+        // attributes are exactly what stock immediate mode would use.
+        if (!g_beamColorKnown)
+            g_getFloatv(GL_CURRENT_COLOR, g_currentColor);
+        if (!g_beamTexKnown)
+        {
+            float tex4[4]{};
+            g_getFloatv(GL_CURRENT_TEXTURE_COORDS, tex4);
+            g_currentTex[0] = tex4[0];
+            g_currentTex[1] = tex4[1];
+        }
+        g_beamColorKnown = true;
+        g_beamTexKnown = true;
+    }
     BeamVertex v{};
     std::memcpy(v.xyz, xyz, sizeof(v.xyz));
     std::memcpy(v.st, g_currentTex, sizeof(v.st));
@@ -660,12 +714,20 @@ void AppendVertex(const float* xyz)
     g_vertices.push_back(v);
 }
 
-void RestoreCurrentAttributes(const float color[4], const float tex[2])
+void RestoreCurrentAttributes(const float color[4], const float tex[2],
+                              bool restoreColor = true,
+                              bool restoreTex = true)
 {
-    if (auto liveColor = ReadPtr<GlColor4fFn>(kQglColor4fRva))
-        liveColor(color[0], color[1], color[2], color[3]);
-    if (auto liveTex = ReadPtr<GlTexCoord2fFn>(kQglTexCoord2fRva))
-        liveTex(tex[0], tex[1]);
+    if (restoreColor)
+    {
+        if (auto liveColor = ReadPtr<GlColor4fFn>(kQglColor4fRva))
+            liveColor(color[0], color[1], color[2], color[3]);
+    }
+    if (restoreTex)
+    {
+        if (auto liveTex = ReadPtr<GlTexCoord2fFn>(kQglTexCoord2fRva))
+            liveTex(tex[0], tex[1]);
+    }
 }
 
 void ReplayPending()
@@ -726,18 +788,8 @@ bool DrawPending()
             newCapacity <<= 1;
         if (newCapacity < bytes)
             return false;
-
-        int previous = 0;
-        g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &previous);
-        for (const unsigned id : g_vbos)
-        {
-            g_bindBuffer(GL_ARRAY_BUFFER, id);
-            g_bufferData(GL_ARRAY_BUFFER,
-                         static_cast<std::ptrdiff_t>(newCapacity),
-                         nullptr, GL_STREAM_DRAW);
-        }
+        // Every upload respecifies its buffer with the current capacity.
         g_vboCapacity = newCapacity;
-        g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previous));
     }
 
     int previousBuffer = 0;
@@ -747,6 +799,24 @@ bool DrawPending()
     float entryTex4[4]{};
     g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &previousBuffer);
     g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
+    if (g_batchKind == CaptureKind::Beam)
+    {
+        // Gold's beam path owns no VBO and no client arrays.  Foreign state
+        // is left untouched and the batch is replayed through stock calls.
+        const bool bufferClear = previousBuffer == 0;
+        if (!bufferClear || !ForeignArraysClear(previousClientTexture))
+        {
+            if (g_collectStats)
+            {
+                ++g_stats.fallbacks;
+                if (bufferClear)
+                    ++g_stats.arrayFallbacks;
+                else
+                    ++g_stats.bufferFallbacks;
+            }
+            return false;
+        }
+    }
     if (preserveCurrent)
     {
         g_getFloatv(GL_CURRENT_COLOR, entryColor);
@@ -757,6 +827,10 @@ bool DrawPending()
     g_pushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
     g_clientActiveTexture(GL_TEXTURE0);
     g_bindBuffer(GL_ARRAY_BUFFER, vbo);
+    // Orphan before the upload so a buffer still read by an earlier batch
+    // never stalls the subdata write.
+    g_bufferData(GL_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(g_vboCapacity),
+                 nullptr, GL_STREAM_DRAW);
     g_bufferSubData(GL_ARRAY_BUFFER, 0,
                     static_cast<std::ptrdiff_t>(bytes), g_vertices.data());
     g_enableClientState(GL_VERTEX_ARRAY);
@@ -848,11 +922,8 @@ void WINAPI TriBeginQglHook(unsigned mode)
         g_currentBeamStart = g_vertices.size();
         if (armKind == CaptureKind::Beam)
         {
-            g_getFloatv(GL_CURRENT_COLOR, g_currentColor);
-            float tex4[4]{};
-            g_getFloatv(GL_CURRENT_TEXTURE_COORDS, tex4);
-            g_currentTex[0] = tex4[0];
-            g_currentTex[1] = tex4[1];
+            g_beamColorKnown = false;
+            g_beamTexKnown = false;
         }
         if (g_collectStats)
         {
@@ -960,6 +1031,7 @@ int __cdecl BeamSpriteTextureHook(void* spriteModel, int frame)
 void __cdecl BeamFinalRenderModeHook(int mode)
 {
     FlushPending();
+    InvalidateSlotCache();
     if (auto live = ReadPtr<TriRenderModeFn>(kTriRenderModeSlotRva))
         live(mode);
     g_currentRenderMode = mode;
@@ -974,6 +1046,7 @@ void WINAPI BeamFinalDepthMaskHook(unsigned char flag)
     // R_DrawBeams restores depth-write/cull state immediately after the beam
     // entity bridge. Flush while the beam render state is still active.
     FlushPending();
+    InvalidateSlotCache();
     auto live = ReadPtr<GlDepthMaskFn>(kQglDepthMaskRva);
     if (live && live != &BeamFinalDepthMaskHook)
         live(flag);
@@ -1001,6 +1074,7 @@ void __cdecl TracerRenderModeHook(int mode)
     // across this boundary, Gold must authoritatively establish additive state.
     FlushPending();
     ResetTracerPass();
+    InvalidateSlotCache();
     if (auto live = ReadPtr<TriRenderModeFn>(kTriRenderModeSlotRva))
         live(mode);
     g_currentRenderMode = mode;
@@ -1046,6 +1120,7 @@ void __cdecl TracerFinalCullFaceHook(int style)
     if (g_tracerFinalAttrsValid)
         RestoreCurrentAttributes(g_currentColor, g_currentTex);
     ResetTracerPass();
+    InvalidateSlotCache();
 
     if (auto live = ReadPtr<TriCullFaceFn>(kTriCullFaceSlotRva))
         live(style);
@@ -1067,6 +1142,7 @@ void __cdecl BeamBrightnessHook(float brightness)
     g_currentColor[2] =
         *reinterpret_cast<float*>(g_hwBase + kTriBlueRva) * alpha * brightness;
     g_currentColor[3] = 1.0f;
+    g_beamColorKnown = true;
 }
 
 void __cdecl BeamTexCoordHook(float s, float t)
@@ -1079,6 +1155,7 @@ void __cdecl BeamTexCoordHook(float s, float t)
     }
     g_currentTex[0] = s;
     g_currentTex[1] = t;
+    g_beamTexKnown = true;
 }
 
 void __cdecl BeamVertexHook(const float* xyz)
@@ -1108,8 +1185,10 @@ void __cdecl BeamEndHook()
     // attributes exactly at every End as before. Tracer capture has no callback
     // boundary in the exact loop, defer its final externally observable current
     // state until the CullFace pass barrier.
+    // Unknown attributes were never suppressed, GL already holds them.
     if (finishedKind == CaptureKind::Beam)
-        RestoreCurrentAttributes(g_currentColor, g_currentTex);
+        RestoreCurrentAttributes(g_currentColor, g_currentTex,
+                                 g_beamColorKnown, g_beamTexKnown);
 
     if (g_vertices.size() > g_currentBeamStart)
     {
@@ -1137,10 +1216,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
     }
 
     g_hwBase = reinterpret_cast<std::uint8_t*>(hw);
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&Install), &g_selfModule);
+    modulerange::Init();
     if (!LoadFunctions())
     {
         rendererlog::Line("beamvbo: required TriAPI/GL entrypoints unavailable");
@@ -1306,6 +1382,7 @@ void UpdateFrame()
 {
     g_enabled = false;
     g_tracerEnabled = false;
+    InvalidateSlotCache();
     if (!g_installed)
         return;
     __try

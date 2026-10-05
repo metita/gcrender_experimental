@@ -2,6 +2,7 @@
 
 #include "hw_build.h"
 #include "log.h"
+#include "module_range.h"
 #include "perf_control.h"
 #include "world_vbo.h"
 
@@ -121,7 +122,6 @@ struct CallPatch
 
 std::uint8_t* g_hwBase = nullptr;
 cl_enginefunc_t* g_engine = nullptr;
-HMODULE g_selfModule = nullptr;
 cvar_t* g_cvar = nullptr;
 bool g_installed = false;
 bool g_enabled = false;
@@ -158,7 +158,17 @@ unsigned char g_currentColorBytes[4]{255, 255, 255, 255};
 float g_currentTex[2]{};
 bool g_touchedColor = false;
 bool g_touchedTex = false;
+bool g_colorKnown = false;
 bool g_lastArrayReject = false;
+
+// Client state validated by CaptureReady.  Nothing between the suppressed
+// Begin and End may legally change it, so DrawCaptured reuses it.
+int g_captureClientTexture = static_cast<int>(GL_TEXTURE0);
+
+// GL_MAX_TEXTURE_UNITS is a context constant.
+int g_textureUnits = 0;
+std::uint32_t g_textureUnitsGeneration = 0;
+
 unsigned g_vbos[3]{};
 unsigned g_vboFrame = 0;
 std::size_t g_vboCapacity = 512u * 1024u;
@@ -319,13 +329,7 @@ bool GlSlotsStable()
     // installs a later qgl hook, fail open so that hook still observes the
     // exact particle immediate-mode traffic.
     auto selfOrExpected = [](const void* live, const void* expected) {
-        if (live == expected)
-            return true;
-        if (!live || !g_selfModule)
-            return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        return VirtualQuery(live, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-               mbi.AllocationBase == g_selfModule;
+        return modulerange::SelfOrExpected(live, expected);
     };
 
     const auto liveTexCoord = ReadQgl<GlTexCoord2fFn>(kQglTexCoord2fRva);
@@ -368,6 +372,19 @@ bool GlSlotsStable()
            ReadQgl<GlBufferDataFn>(kQglBufferDataRva) == g_bufferData;
 }
 
+int TextureUnits()
+{
+    const std::uint32_t generation = worldvbo::ContextGeneration();
+    if (g_textureUnits == 0 || g_textureUnitsGeneration != generation)
+    {
+        int units = 0;
+        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &units);
+        g_textureUnits = units;
+        g_textureUnitsGeneration = generation;
+    }
+    return g_textureUnits;
+}
+
 bool CaptureReady()
 {
     g_lastArrayReject = false;
@@ -388,9 +405,8 @@ bool CaptureReady()
     }
 
     int checkClientTexture = static_cast<int>(GL_TEXTURE0);
-    int maxTextureUnits = 0;
     g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &checkClientTexture);
-    g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
+    const int maxTextureUnits = TextureUnits();
     if (maxTextureUnits < 1 || maxTextureUnits > 32)
     {
         g_lastArrayReject = true;
@@ -410,6 +426,7 @@ bool CaptureReady()
     }
     g_clientActiveTexture(
         static_cast<unsigned>(checkClientTexture));
+    g_captureClientTexture = checkClientTexture;
 
     int arrayBuffer = 0;
     g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &arrayBuffer);
@@ -467,8 +484,27 @@ CallbackGuardResult ParticleCallbacksRequireStock()
     }
 }
 
+unsigned char ColorByte(float value)
+{
+    if (value <= 0.0f)
+        return 0;
+    if (value >= 1.0f)
+        return 255;
+    return static_cast<unsigned char>(value * 255.0f + 0.5f);
+}
+
 void AppendVertex(float x, float y, float z)
 {
+    if (!g_colorKnown)
+    {
+        // Every exact particle sets its color before its vertices, so this
+        // only runs if that ever changes.  Nothing reached GL since the
+        // suppressed Begin, the live current color is the stock one.
+        g_getFloatv(GL_CURRENT_COLOR, g_currentColor);
+        for (int i = 0; i < 4; ++i)
+            g_currentColorBytes[i] = ColorByte(g_currentColor[i]);
+        g_colorKnown = true;
+    }
     ParticleVertex v{};
     v.xyz[0] = x;
     v.xyz[1] = y;
@@ -477,15 +513,6 @@ void AppendVertex(float x, float y, float z)
     v.st[1] = g_currentTex[1];
     std::memcpy(v.rgba, g_currentColorBytes, sizeof(v.rgba));
     g_vertices.push_back(v);
-}
-
-unsigned char ColorByte(float value)
-{
-    if (value <= 0.0f)
-        return 0;
-    if (value >= 1.0f)
-        return 255;
-    return static_cast<unsigned char>(value * 255.0f + 0.5f);
 }
 
 void WINAPI ParticleBegin(unsigned mode)
@@ -513,9 +540,7 @@ void WINAPI ParticleBegin(unsigned mode)
         g_vertices.clear();
         g_touchedColor = false;
         g_touchedTex = false;
-        g_getFloatv(GL_CURRENT_COLOR, g_currentColor);
-        for (int i = 0; i < 4; ++i)
-            g_currentColorBytes[i] = ColorByte(g_currentColor[i]);
+        g_colorKnown = false;
         if (g_collectStats)
             ++g_stats.captures;
         return;
@@ -557,6 +582,7 @@ void WINAPI ParticleColor4ubv(const unsigned char* rgba)
     g_currentColor[3] = static_cast<float>(rgba[3]) * inv255;
     std::memcpy(g_currentColorBytes, rgba, sizeof(g_currentColorBytes));
     g_touchedColor = true;
+    g_colorKnown = true;
 }
 
 void WINAPI ParticleTexCoord2f(float s, float t)
@@ -604,10 +630,9 @@ void DrawCaptured()
         return;
     }
 
-    int previousBuffer = 0;
-    int previousClientTexture = static_cast<int>(GL_TEXTURE0);
-    g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &previousBuffer);
-    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
+    // CaptureReady required ARRAY_BUFFER_BINDING 0 and recorded the client
+    // active texture at the suppressed Begin.
+    const int previousClientTexture = g_captureClientTexture;
     const std::size_t bytes =
         g_vertices.size() * sizeof(ParticleVertex);
 
@@ -621,23 +646,18 @@ void DrawCaptured()
         }
         if (newCapacity < bytes)
             return;
-
-        for (const unsigned id : g_vbos)
-        {
-            g_bindBuffer(GL_ARRAY_BUFFER, id);
-            g_bufferData(GL_ARRAY_BUFFER,
-                         static_cast<std::ptrdiff_t>(newCapacity),
-                         nullptr, GL_STREAM_DRAW);
-        }
+        // Every upload respecifies its buffer with the current capacity.
         g_vboCapacity = newCapacity;
-        g_bindBuffer(GL_ARRAY_BUFFER,
-                     static_cast<unsigned>(previousBuffer));
     }
 
     const unsigned vbo = g_vbos[g_vboFrame++ % 3u];
     g_pushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
     g_clientActiveTexture(GL_TEXTURE0);
     g_bindBuffer(GL_ARRAY_BUFFER, vbo);
+    // Orphan before the upload so the previous frame's draw from this buffer
+    // never stalls the subdata write.
+    g_bufferData(GL_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(g_vboCapacity),
+                 nullptr, GL_STREAM_DRAW);
     g_bufferSubData(GL_ARRAY_BUFFER, 0,
                     static_cast<std::ptrdiff_t>(bytes),
                     g_vertices.data());
@@ -654,7 +674,7 @@ void DrawCaptured()
                    reinterpret_cast<const void*>(
                        offsetof(ParticleVertex, rgba)));
     g_drawArrays(GL_TRIANGLES, 0, static_cast<int>(g_vertices.size()));
-    g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previousBuffer));
+    g_bindBuffer(GL_ARRAY_BUFFER, 0);
     g_popClientAttrib();
     g_clientActiveTexture(static_cast<unsigned>(previousClientTexture));
 
@@ -704,10 +724,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
     }
     g_hwBase = reinterpret_cast<std::uint8_t*>(hw);
     g_engine = engine;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&Install), &g_selfModule);
+    modulerange::Init();
     if (!GlReady())
     {
         rendererlog::Line("particlevbo: required GL entrypoints unavailable");
