@@ -754,6 +754,79 @@ bool DirectFallback(DirectFallbackReason reason)
     return false;
 }
 
+// Profiling breakdown of DirectFallbackReason::Material, one entry per
+// return site in TryDirectDraw and ResolveDirectMaterial.
+enum class MaterialReject : unsigned
+{
+    Reserve,
+    HeaderCounts,
+    SkinTable,
+    TextureSlot,
+    TextureArray,
+    AltUv,
+    TextureSize,
+    IndexCount,
+    LastVertex,
+    FlatLight,
+    Store,
+    ChromePrepare,
+    ChromeUpload,
+    Count
+};
+
+constexpr const char* kMaterialRejectNames[
+    static_cast<unsigned>(MaterialReject::Count)] = {
+    "reserve", "header", "skintable", "slot", "textures", "altuv",
+    "size", "indices", "lastvertex", "flatlight", "store",
+    "chromePrep", "chromeUpload"
+};
+
+std::uint64_t g_materialReject[
+    static_cast<unsigned>(MaterialReject::Count)]{};
+
+bool MaterialFallback(MaterialReject reason)
+{
+    if (prof::Active())
+        ++g_materialReject[static_cast<unsigned>(reason)];
+    return DirectFallback(DirectFallbackReason::Material);
+}
+
+// Profiling breakdown of every RecordDeferredDirectDraw refusal, split by
+// player and non-player. A non-player refusal is DirectFallbackReason::Execute
+// (deferred-only rule), a player refusal takes the immediate retained path.
+enum class RecordReject : unsigned
+{
+    Scope,
+    ReplayReady,
+    VertexArray,
+    Capacity,
+    Prepared,
+    Texture,
+    Remap,
+    Additive,
+    Matrices,
+    MatrixSplit,
+    CullState,
+    ChromePrepare,
+    ChromeCapacity,
+    Store,
+    Count
+};
+
+constexpr const char* kRecordRejectNames[
+    static_cast<unsigned>(RecordReject::Count)] = {
+    "scope", "replay", "vao", "capacity", "prepared", "texture", "remap",
+    "additive", "matrices", "matrixSplit", "cull", "chromePrep",
+    "chromeCap", "store"
+};
+
+std::uint64_t g_recordReject[2][
+    static_cast<unsigned>(RecordReject::Count)]{};
+std::uint64_t g_executeNonPlayerRecord = 0;
+std::uint64_t g_executeImmediate = 0;
+std::uint64_t g_deferredChromeRecords = 0;
+std::uint64_t g_deferredMaskedRecords = 0;
+
 enum class GlobalRejectReason : unsigned
 {
     ReadGlobals,
@@ -851,9 +924,18 @@ struct DirectTimingStats
     long long restoreTicks = 0;
     long long directAttemptTicks = 0;
     long long fallbackAttemptTicks = 0;
+    // Deferred-run flushes reached from DirectKernelDispatch (immediate,
+    // matrix-split and fallback barriers). They submit other entities'
+    // packets and replay deferred client shadows, so they are excluded from
+    // the per-draw attempt times above and reported on their own.
+    std::uint64_t dispatchFlushes = 0;
+    long long dispatchFlushTicks = 0;
 };
 
 DirectTimingStats g_directTiming{};
+// Monotonic sum of profiled flush time, sampled around each dispatch.
+long long g_profiledFlushTicks = 0;
+std::uint64_t g_profiledFlushCount = 0;
 
 double TimingMicrosPerCall(long long ticks, std::uint64_t calls)
 {
@@ -2962,6 +3044,17 @@ struct DeferredStudioCommand
     // Number of client shadows deferred before this packet was recorded.
     // Packets of different segments are never reordered across a shadow.
     std::size_t segment = 0;
+    // CHROME packets: this command's stock chrome UVs for the submodel's
+    // vertex range, g_deferredChromeUvs[chromeUvFirst, + chromeUvCount),
+    // staged by the flush into the chrome stream buffer. chromeStreamBase is
+    // the attribute offset for vertex 0 of the retained cache, so the data
+    // lands at chromeStreamBase + firstVertex * sizeof(ChromeUv).
+    std::size_t chromeUvFirst = 0;
+    std::size_t chromeUvCount = 0;
+    std::size_t chromeFirstVertex = 0;
+    std::size_t chromeStreamBase = 0;
+    bool hasChrome = false;
+    bool hasMasked = false;
 };
 
 // One flush draw group. count == 1 replays a command through the ordinary
@@ -3005,6 +3098,16 @@ struct DeferredShadow
 
 std::vector<DeferredStudioCommand> g_deferredCommands;
 std::vector<DeferredShadow> g_deferredShadows;
+// Deferred CHROME coordinates of the pending run and the size of the stream
+// image the flush uploads (padding included, see chromeStreamBase).
+std::vector<ChromeUv> g_deferredChromeUvs;
+std::size_t g_deferredChromeStreamBytes = 0;
+bool g_deferredRunHasMasked = false;
+// One stream buffer, orphaned and refilled by every flush that carries CHROME
+// packets. Bound to GL_ARRAY_BUFFER only inside the flush.
+constexpr std::size_t kChromeStreamMaxBytes = 4u << 20;
+unsigned g_chromeStreamBuffer = 0;
+std::uint32_t g_chromeStreamGeneration = 0;
 std::vector<DeferredMeshDraw> g_deferredMeshes;
 std::vector<float> g_deferredBoneFloats;
 std::vector<std::size_t> g_deferredOrder;
@@ -3072,8 +3175,12 @@ struct FlushProfileStats
     std::uint64_t shadowEnvFixes = 0;
     std::uint64_t shadowMatrixLoads = 0;
     std::uint64_t shadowReplayFailures = 0;
+    std::uint64_t chromeRecords = 0;
+    std::uint64_t maskedRecords = 0;
+    std::uint64_t chromeStreamBytes = 0;
     long long ticks = 0;
     long long chargedTicks = 0;
+    long long shadowReplayTicks = 0;
 };
 
 FlushProfileStats g_flushProfile{};
@@ -3096,7 +3203,11 @@ bool DeferredCommandsShareInstanceKey(
     const DeferredStudioCommand& first,
     const DeferredStudioCommand& second)
 {
-    if (!first.cache || first.cache != second.cache ||
+    // CHROME and MASKED packets carry per-packet UV sources or alpha-test
+    // state the instanced program does not replay, they stay single.
+    if (first.hasChrome || second.hasChrome ||
+        first.hasMasked || second.hasMasked ||
+        !first.cache || first.cache != second.cache ||
         !first.submodel || first.submodel != second.submodel ||
         first.rendererType != second.rendererType ||
         first.mirror != second.mirror ||
@@ -3267,12 +3378,35 @@ bool UploadDirectMatrices(const DirectMatrices& matrices)
     }
 }
 
+// Gold's texture resolver (hw+0x98AE0) only leaves the descriptor's own glId
+// bound for an entity with index > 0 when the name is neither "DM_Base.bmp"
+// (_stricmp) nor a parsable remap name, which needs V_strnicmp(name,
+// "Remap", 5) == 0 and a length of exactly 18 or 22. Any name that could pass
+// either test keeps the per-mesh resolver call. This is a superset of the
+// real remap names: case folding never changes the length or turns another
+// first byte into D/d or R/r.
+bool TextureMayRemap(const StudioTextureRaw& texture)
+{
+    const unsigned char first =
+        static_cast<unsigned char>(texture.name[0]);
+    std::size_t length = 0;
+    while (length < sizeof(texture.name) && texture.name[length] != '\0')
+        ++length;
+    if (first == 'D' || first == 'd')
+        return length == 11u;
+    if (first == 'R' || first == 'r')
+        return length == 18u || length == 22u;
+    return false;
+}
+
 bool ResolveDirectMaterial(const StudioHeaderRaw* header,
                            int skinFamily,
                            const RetainedSubmesh& mesh,
-                           DirectMaterial& out)
+                           DirectMaterial& out,
+                           MaterialReject& reject)
 {
     out = {};
+    reject = MaterialReject::HeaderCounts;
     if (!header ||
         header->numtextures <= 0 || header->numtextures > 4096 ||
         header->textureindex <= 0 ||
@@ -3282,6 +3416,7 @@ bool ResolveDirectMaterial(const StudioHeaderRaw* header,
         mesh.skinref < 0 || mesh.skinref >= header->numskinref)
         return false;
 
+    reject = MaterialReject::SkinTable;
     const std::size_t skinCount =
         static_cast<std::size_t>(header->numskinref) *
         static_cast<std::size_t>(header->numskinfamilies);
@@ -3293,6 +3428,7 @@ bool ResolveDirectMaterial(const StudioHeaderRaw* header,
     if (!skinTable)
         return false;
 
+    reject = MaterialReject::TextureSlot;
     const std::size_t skinOffset =
         static_cast<std::size_t>(skinFamily) *
             static_cast<std::size_t>(header->numskinref) +
@@ -3302,6 +3438,7 @@ bool ResolveDirectMaterial(const StudioHeaderRaw* header,
     if (textureSlot < 0 || textureSlot >= header->numtextures)
         return false;
 
+    reject = MaterialReject::TextureArray;
     const StudioTextureRaw* textures =
         HeaderArray<StudioTextureRaw>(
             header, header->textureindex, header->numtextures);
@@ -3310,10 +3447,17 @@ bool ResolveDirectMaterial(const StudioHeaderRaw* header,
     const StudioTextureRaw& texture = textures[textureSlot];
     const unsigned flags = static_cast<unsigned>(texture.flags);
     // Retained Standard owns ordinary/FULLBRIGHT/FLATSHADE, CHROME, MASKED
-    // and ADDITIVE. CHROME UVs are supplied by the exact stock CPU prepass,
-    // AltUV and other material-state flags stay Gold-owned.
-    if ((flags & ~(5u | 0x02u | 0x20u | 0x40u)) != 0u)
+    // and ADDITIVE. CHROME UVs are supplied by the exact stock CPU prepass.
+    // Inside DrawPoints Gold reads only bits 0x01/0x04 (R_StudioLighting
+    // hw+0x96B50), 0x02/0x20/0x40 and the sign bit (emitter selection and
+    // material state, hw+0x9AE80). The sign bit selects the AltUV emitter
+    // and stays Gold-owned. Every other bit (NOMIPS, ALPHA and the private
+    // bits some compilers set, e.g. 0x800/0x1000) only affects texture upload
+    // and does not change the draw.
+    reject = MaterialReject::AltUv;
+    if ((flags & 0x80000000u) != 0u)
         return false;
+    reject = MaterialReject::TextureSize;
     if (texture.width <= 0 || texture.height <= 0)
         return false;
 
@@ -3329,11 +3473,10 @@ bool ResolveDirectMaterial(const StudioHeaderRaw* header,
         out.sScale *= (1.0f / 1024.0f);
         out.tScale *= (1.0f / 1024.0f);
     }
-    const unsigned char first =
-        static_cast<unsigned char>(texture.name[0]);
-    out.directBind =
-        first != 'D' && first != 'd' &&
-        first != 'R' && first != 'r';
+    // The former first-letter test sent every D*/R* name (receiver.bmp,
+    // reticle.bmp, DE_slide1.bmp, ...) through the resolver, which also kept
+    // those meshes out of the deferred recorder.
+    out.directBind = !TextureMayRemap(texture);
     return true;
 }
 
@@ -3392,7 +3535,8 @@ bool AdditiveEntryStateReady()
 // Barrier order-independence.
 //
 // Pending deferred packets are opaque: depth-tested, depth-written, blend
-// forced off by the flush. Any other draw that is itself opaque, depth-tested
+// forced off by the flush (MASKED meshes additionally alpha-tested, which
+// only discards fragments). Any other draw that is itself opaque, depth-tested
 // and depth-writing produces the same color and depth per pixel whether it
 // reaches GL before or after them, so the barrier in front of it can be
 // skipped. Only exact equal-depth ties between different entities could
@@ -6084,30 +6228,129 @@ enum class FlushSite
 
 bool FlushDeferredSolidCommands(FlushSite site, FlushTrigger trigger);
 
+// Creates the CHROME stream buffer name for the live context. Its storage is
+// (re)specified by every flush that uses it. Names of an older context died
+// with it and are dropped, not deleted.
+bool EnsureChromeStreamBuffer()
+{
+    if (!g_genBuffers || !worldvbo::ContextGenerationReady())
+        return false;
+    const std::uint32_t generation = worldvbo::ContextGeneration();
+    if (g_chromeStreamBuffer && g_chromeStreamGeneration == generation)
+        return true;
+    unsigned buffer = 0;
+    __try
+    {
+        g_genBuffers(1, &buffer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        buffer = 0;
+    }
+    if (!buffer)
+        return false;
+    g_chromeStreamBuffer = buffer;
+    g_chromeStreamGeneration = generation;
+    return true;
+}
+
+// MASKED and CHROME packets are recorded as well.
+//
+// MASKED meshes are alpha-tested (GREATER 0.5) and depth-written: every
+// fragment is either discarded or written with its color and depth, the same
+// order-independent class as the opaque packets. The flush applies Gold's
+// BeginMaskedMaterial state around exactly those mesh draws and returns alpha
+// test to its flush-entry state afterwards. At the original DrawPoints point
+// only the state Gold leaves behind is reproduced (EndMaskedMaterial: alpha
+// func NOTEQUAL 0, alpha test off, depth writes on).
+//
+// CHROME coordinates depend on the entity's bones and the view (chromeage /
+// chrome basis). They are computed at the original call through the stock
+// R_StudioChrome, in Gold's mesh order and with its chrome-table side effects
+// (PrepareChromeCoordinates, the same prepass the immediate path uses), and
+// the per-vertex result is copied into the packet. The flush stages every
+// packet's coordinates into one stream buffer and points the VAO's raw-ST
+// attribute at them for the CHROME meshes only, exactly the source the
+// immediate path binds from the cache's chrome buffer.
+//
+// ADDITIVE meshes (ONE/ONE blend, no depth writes) and remap textures (the
+// resolver may upload a per-entity texture) stay immediate/stock.
 bool RecordDeferredDirectDraw(const DirectGlobals& state,
                               RetainedCache& cache,
-                              const RetainedSubmodel& submodel)
+                              const RetainedSubmodel& submodel,
+                              bool& chromePrepared)
 {
+    chromePrepared = false;
+    const unsigned rejectSide = state.player == 0 ? 1u : 0u;
+    auto refuse = [rejectSide](RecordReject reason) -> bool
+    {
+        if (prof::Active())
+            ++g_recordReject[rejectSide][static_cast<unsigned>(reason)];
+        return false;
+    };
+
     // The reserved indexed UBO point is module-owned and the flush rebinds the
     // exact range of every draw, so recording never reads it back.
     if (g_deferredFlushInProgress ||
         !g_deferredBarriersReady ||
-        g_solidEntityPassDepth <= 0 ||
-        !DeferredReplayReady() ||
-        !cache.vertexArray ||
-        !g_bindVertexArray ||
-        !DeferredCapacityAvailable() ||
-        g_preparedMeshes.empty() ||
+        g_solidEntityPassDepth <= 0)
+        return refuse(RecordReject::Scope);
+    if (!DeferredReplayReady())
+        return refuse(RecordReject::ReplayReady);
+    if (!cache.vertexArray || !g_bindVertexArray)
+        return refuse(RecordReject::VertexArray);
+    if (!DeferredCapacityAvailable())
+        return refuse(RecordReject::Capacity);
+    if (g_preparedMeshes.empty() ||
         g_preparedMeshes.size() != submodel.meshes.size())
-        return false;
+        return refuse(RecordReject::Prepared);
 
+    bool hasChrome = false;
+    bool hasMasked = false;
     for (const PreparedDirectMesh& prepared : g_preparedMeshes)
     {
-        if (!prepared.mesh || !prepared.material.directBind ||
-            !prepared.material.texture ||
-            prepared.material.texture->glId == 0 ||
-            (prepared.material.flags & (0x02u | 0x20u | 0x40u)) != 0u)
-            return false;
+        if (!prepared.mesh || !prepared.material.texture ||
+            prepared.material.texture->glId == 0)
+            return refuse(RecordReject::Texture);
+        if (!prepared.material.directBind)
+            return refuse(RecordReject::Remap);
+        if ((prepared.material.flags & 0x20u) != 0u)
+            return refuse(RecordReject::Additive);
+        if ((prepared.material.flags & 0x02u) != 0u)
+            hasChrome = true;
+        if ((prepared.material.flags & 0x40u) != 0u)
+            hasMasked = true;
+    }
+    // The flush reads and restores the alpha-test function around MASKED
+    // draws, it must not discover a missing entry point after acceptance.
+    if (hasMasked &&
+        (!g_alphaFunc || !g_getFloatv || !g_isEnabled ||
+         !g_enable || !g_disable || !g_depthMask))
+        return refuse(RecordReject::ReplayReady);
+
+    std::size_t chromeStreamBase = 0;
+    std::size_t chromeStreamEnd = g_deferredChromeStreamBytes;
+    if (hasChrome)
+    {
+        // Same capacity check as the stream placement below, before any
+        // Gold-visible chrome work.
+        const std::size_t vertexBytes = sizeof(ChromeUv);
+        if (!g_bufferData || !g_bufferSubData ||
+            !g_vertexAttribPointer ||
+            !EnsureChromeStreamBuffer() ||
+            submodel.vertexCount == 0 ||
+            submodel.firstVertex > kChromeStreamMaxBytes / vertexBytes ||
+            submodel.vertexCount > kChromeStreamMaxBytes / vertexBytes)
+            return refuse(RecordReject::ChromeCapacity);
+        const std::size_t firstBytes = submodel.firstVertex * vertexBytes;
+        const std::size_t dataStart =
+            (std::max)(AlignUp(g_deferredChromeStreamBytes, 16u), firstBytes);
+        const std::size_t dataBytes = submodel.vertexCount * vertexBytes;
+        if (dataStart > kChromeStreamMaxBytes ||
+            dataBytes > kChromeStreamMaxBytes - dataStart)
+            return refuse(RecordReject::ChromeCapacity);
+        chromeStreamBase = dataStart - firstBytes;
+        chromeStreamEnd = dataStart + dataBytes;
     }
 
     DirectMatrices candidateMatrices{};
@@ -6119,13 +6362,13 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
         g_deferredRunMatricesVerify = false;
         // Once per barrier-delimited stretch of the pass, see g_passMatrices.
         if (!AcquireDirectMatrices(candidateMatrices))
-            return false;
+            return refuse(RecordReject::Matrices);
         commitRunMatrices = true;
     }
     else
     {
         if (!g_deferredRunMatricesValid)
-            return false;
+            return refuse(RecordReject::Matrices);
         // Production reuses the run matrices for every entity. While profiling,
         // one entity change in 256 is compared against live GL so a foreign
         // per-entity matrix writer shows up in the report. The first record
@@ -6139,7 +6382,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
              (++g_matrixVerifySequence & 0xFFu) == 0u))
         {
             if (!CaptureDirectMatrices(candidateMatrices))
-                return false;
+                return refuse(RecordReject::Matrices);
             g_deferredRunMatricesVerify = false;
             if (!forcedVerify || prof::Active())
                 ++g_flushProfile.matrixVerifies;
@@ -6160,7 +6403,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
                         FlushSite::InsideStudioDraw,
                         FlushTrigger::MatrixSplit) ||
                     !g_deferredCommands.empty())
-                    return false;
+                    return refuse(RecordReject::MatrixSplit);
                 if (PassSnapshotsAllowed())
                 {
                     g_passMatrices = candidateMatrices;
@@ -6177,7 +6420,19 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     int rendererType = 1;
     if (!CaptureDeferredCullState(
             mirror, rendererType))
-        return false;
+        return refuse(RecordReject::CullState);
+
+    // Stock chrome prepass at the original call, see the notes above. A
+    // refusal after this point leaves Gold's chrome table exactly as a stock
+    // DrawPoints would (R_StudioChrome is idempotent for a given chromeage
+    // stamp), and the immediate path reuses the prepared coordinates.
+    if (hasChrome)
+    {
+        if (!PrepareChromeCoordinates(state, cache, submodel) ||
+            g_chromeUvScratch.size() != submodel.vertexCount)
+            return refuse(RecordReject::ChromePrepare);
+        chromePrepared = true;
+    }
 
     const std::size_t oldCommandCount =
         g_deferredCommands.size();
@@ -6185,6 +6440,8 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
         g_deferredMeshes.size();
     const std::size_t oldBoneFloatCount =
         g_deferredBoneFloats.size();
+    const std::size_t oldChromeUvCount =
+        g_deferredChromeUvs.size();
 
     DeferredStudioCommand command{};
     command.cache = &cache;
@@ -6200,9 +6457,22 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     command.mirror = mirror;
     command.rendererType = rendererType;
     command.segment = g_deferredShadows.size();
+    command.hasChrome = hasChrome;
+    command.hasMasked = hasMasked;
 
     try
     {
+        if (hasChrome)
+        {
+            command.chromeUvFirst = oldChromeUvCount;
+            command.chromeUvCount = g_chromeUvScratch.size();
+            command.chromeFirstVertex = submodel.firstVertex;
+            command.chromeStreamBase = chromeStreamBase;
+            g_deferredChromeUvs.insert(
+                g_deferredChromeUvs.end(),
+                g_chromeUvScratch.begin(),
+                g_chromeUvScratch.end());
+        }
         const std::size_t requiredFloats =
             static_cast<std::size_t>(
                 submodel.bonePaletteCount) * 16u;
@@ -6282,7 +6552,8 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
         g_deferredMeshes.resize(oldMeshCount);
         g_deferredBoneFloats.resize(
             oldBoneFloatCount);
-        return false;
+        g_deferredChromeUvs.resize(oldChromeUvCount);
+        return refuse(RecordReject::Store);
     }
 
     if (commitRunMatrices)
@@ -6291,6 +6562,20 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
         g_deferredRunMatricesValid = true;
     }
     g_deferredLastEntity = state.entity;
+    if (hasChrome)
+    {
+        g_deferredChromeStreamBytes = chromeStreamEnd;
+        ++g_deferredChromeRecords;
+        if (prof::Active())
+            ++g_flushProfile.chromeRecords;
+    }
+    if (hasMasked)
+    {
+        g_deferredRunHasMasked = true;
+        ++g_deferredMaskedRecords;
+        if (prof::Active())
+            ++g_flushProfile.maskedRecords;
+    }
 
     // Gold-visible accounting/current immediate state still happens at the
     // original DrawPoints point. Only the GPU submission is deferred.
@@ -6309,6 +6594,11 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     g_deferredEntryTextureValid = true;
     (void)RestoreFinalImmediateState(
         state, cache, *last.mesh, last.material);
+    // Stock leaves Gold's post-MASKED state behind (alpha func NOTEQUAL 0,
+    // alpha test off, depth writes on). Entry already had alpha test off and
+    // depth writes on (MaskedEntryStateReady), only the func can differ.
+    if (hasMasked)
+        (void)EndMaskedMaterial();
 
     ++g_deferredRecorded;
     return true;
@@ -6735,6 +7025,7 @@ void ReplayDeferredShadows(std::size_t first,
     if (first >= last || last > g_deferredShadows.size())
         return;
     const bool collect = prof::Active();
+    const long long replayStart = collect ? prof::Now() : 0;
 
     // Gold's TMU shadow is 0 after RestoreFlushEntryState's Gold bind. Make GL
     // agree before anything is queried, the shadow binds through Gold.
@@ -6862,6 +7153,46 @@ void ReplayDeferredShadows(std::size_t first,
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (collect)
+        g_flushProfile.shadowReplayTicks += prof::Now() - replayStart;
+}
+
+// Flush-side material transitions, called inside the flush's SEH scope with
+// the packet's VAO bound. The raw-ST attribute is VAO state: CHROME meshes
+// point it at the stream image, every other mesh and every later user of the
+// VAO (immediate draws) needs the static source back.
+void BindChromeStreamRawSt(std::size_t base)
+{
+    g_bindBuffer(GL_ARRAY_BUFFER, g_chromeStreamBuffer);
+    g_vertexAttribPointer(
+        kAttribRawST, 2, GL_FLOAT, GL_FALSE_VALUE,
+        sizeof(ChromeUv),
+        reinterpret_cast<const void*>(base));
+}
+
+void BindStaticRawSt(const RetainedCache& cache)
+{
+    g_bindBuffer(GL_ARRAY_BUFFER, cache.vertexBuffer);
+    g_vertexAttribPointer(
+        kAttribRawST, 2, GL_SHORT, GL_FALSE_VALUE,
+        sizeof(RetainedVertex),
+        reinterpret_cast<const void*>(
+            offsetof(RetainedVertex, rawST)));
+}
+
+// Gold's MASKED state (BeginMaskedMaterial). Depth writes are already forced
+// on by the flush.
+void BeginFlushMasked()
+{
+    g_enable(GL_ALPHA_TEST);
+    g_alphaFunc(GL_GREATER, 0.5f);
+}
+
+void EndFlushMasked(bool alphaTest, int alphaFunc, float alphaRef)
+{
+    g_alphaFunc(static_cast<unsigned>(alphaFunc), alphaRef);
+    if (!alphaTest)
+        g_disable(GL_ALPHA_TEST);
 }
 
 bool FlushDeferredSolidCommandsImpl()
@@ -6912,8 +7243,9 @@ bool FlushDeferredSolidCommandsImpl()
 
     // Only state this flush changes and whose previous value is not already
     // known is read back here:
-    // - ARRAY_BUFFER is never bound by the flush, ELEMENT_ARRAY_BUFFER is VAO
-    //   state and returns with the previous VAO.
+    // - ARRAY_BUFFER is only bound for CHROME packets (read below in that
+    //   case), ELEMENT_ARRAY_BUFFER is VAO state and returns with the
+    //   previous VAO.
     // - Every recorded packet uses Gold's ordinary renderer type, which has no
     //   cull transition, so cull face/mode are never touched.
     // - The reserved indexed UBO point and the generic UBO target are
@@ -6941,10 +7273,36 @@ bool FlushDeferredSolidCommandsImpl()
     // have run since (see the skipped barriers), so the live binding is the
     // value to hand back to Gold.
     int previousTexture0 = 0;
+    // CHROME packets rebind GL_ARRAY_BUFFER to the chrome stream and back to
+    // their cache VBO, MASKED packets change the alpha test. Both are read
+    // only when the run carries such a packet and are restored on exit.
+    const bool runHasChrome = g_deferredChromeStreamBytes != 0;
+    const bool runHasMasked = g_deferredRunHasMasked;
+    int previousArrayBuffer = 0;
+    bool previousAlphaTest = false;
+    int previousAlphaFunc = static_cast<int>(GL_NOTEQUAL);
+    float previousAlphaRef = 0.0f;
+    if (runHasChrome &&
+        (!g_chromeStreamBuffer ||
+         g_chromeStreamGeneration != worldvbo::ContextGeneration() ||
+         !g_bufferData || !g_vertexAttribPointer ||
+         g_deferredChromeStreamBytes > kChromeStreamMaxBytes))
+        return false;
+    if (runHasMasked && (!g_alphaFunc || !g_getFloatv))
+        return false;
     if (!ReadActiveTexture(previousActiveTexture))
         return false;
     __try
     {
+        if (runHasChrome)
+            g_getIntegerv(
+                GL_ARRAY_BUFFER_BINDING, &previousArrayBuffer);
+        if (runHasMasked)
+        {
+            previousAlphaTest = g_isEnabled(GL_ALPHA_TEST) != 0;
+            g_getIntegerv(GL_ALPHA_TEST_FUNC, &previousAlphaFunc);
+            g_getFloatv(GL_ALPHA_TEST_REF, &previousAlphaRef);
+        }
         g_getIntegerv(
             GL_CURRENT_PROGRAM, &previousProgram);
         g_getIntegerv(
@@ -6994,6 +7352,11 @@ bool FlushDeferredSolidCommandsImpl()
     bool rangeBound = false;
     std::size_t boundRangeOffset = 0;
     std::size_t boundRangeSize = 0;
+    // VAO whose raw-ST attribute currently points at the chrome stream, and
+    // whether Gold's MASKED alpha test is applied. Both are undone at the end
+    // of every packet, before shadow replay and on a faulted submission.
+    const RetainedCache* chromeCache = nullptr;
+    bool maskedActive = false;
     g_deferredFlushInProgress = true;
     __try
     {
@@ -7115,6 +7478,45 @@ bool FlushDeferredSolidCommandsImpl()
         }
         g_uniformBufferOffset = nextUniformOffset;
 
+        // CHROME coordinates, staged like the bone blocks before any draw:
+        // orphan the stream storage, then copy each packet's range to its
+        // planned offset (see DeferredStudioCommand::chromeStreamBase).
+        if (runHasChrome)
+        {
+            g_bindBuffer(GL_ARRAY_BUFFER, g_chromeStreamBuffer);
+            g_bufferData(
+                GL_ARRAY_BUFFER,
+                static_cast<std::ptrdiff_t>(g_deferredChromeStreamBytes),
+                nullptr,
+                GL_STREAM_DRAW);
+            for (const DeferredStudioCommand& command : g_deferredCommands)
+            {
+                if (!command.hasChrome)
+                    continue;
+                const std::size_t offset =
+                    command.chromeStreamBase +
+                    command.chromeFirstVertex * sizeof(ChromeUv);
+                const std::size_t bytes =
+                    command.chromeUvCount * sizeof(ChromeUv);
+                if (command.chromeUvFirst > g_deferredChromeUvs.size() ||
+                    command.chromeUvCount >
+                        g_deferredChromeUvs.size() - command.chromeUvFirst ||
+                    offset > g_deferredChromeStreamBytes ||
+                    bytes > g_deferredChromeStreamBytes - offset)
+                    __leave;
+                if (bytes == 0)
+                    continue;
+                g_bufferSubData(
+                    GL_ARRAY_BUFFER,
+                    static_cast<std::ptrdiff_t>(offset),
+                    static_cast<std::ptrdiff_t>(bytes),
+                    g_deferredChromeUvs.data() + command.chromeUvFirst);
+            }
+            if (prof::Active())
+                g_flushProfile.chromeStreamBytes +=
+                    g_deferredChromeStreamBytes;
+        }
+
         g_useProgram(g_program);
         if (g_gammaFitProgramRevision !=
             g_gammaFitRevision)
@@ -7165,6 +7567,12 @@ bool FlushDeferredSolidCommandsImpl()
                 const std::size_t shadowEnd =
                     (std::min)(command.segment,
                                g_deferredShadows.size());
+                // GL_ARRAY_BUFFER is not VAO state. The shadow's triangle
+                // API draw must see the binding it had at its original call.
+                if (runHasChrome)
+                    g_bindBuffer(
+                        GL_ARRAY_BUFFER,
+                        static_cast<unsigned>(previousArrayBuffer));
                 RestoreFlushEntryState(entry);
                 ReplayDeferredShadows(
                     nextShadow, shadowEnd, entry, shadowMatrixState);
@@ -7400,6 +7808,30 @@ bool FlushDeferredSolidCommandsImpl()
                 {
                     ++g_deferredParamsUniformSkips;
                 }
+                const bool chromeDraw = (draw.flags & 0x02u) != 0u;
+                const bool maskedDraw = (draw.flags & 0x40u) != 0u;
+                if (chromeDraw && !chromeCache)
+                {
+                    BindChromeStreamRawSt(command.chromeStreamBase);
+                    chromeCache = command.cache;
+                }
+                else if (!chromeDraw && chromeCache)
+                {
+                    BindStaticRawSt(*chromeCache);
+                    chromeCache = nullptr;
+                }
+                if (maskedDraw && !maskedActive)
+                {
+                    BeginFlushMasked();
+                    maskedActive = true;
+                }
+                else if (!maskedDraw && maskedActive)
+                {
+                    EndFlushMasked(
+                        previousAlphaTest, previousAlphaFunc,
+                        previousAlphaRef);
+                    maskedActive = false;
+                }
                 g_drawElements(
                     GL_TRIANGLES,
                     static_cast<int>(
@@ -7410,12 +7842,58 @@ bool FlushDeferredSolidCommandsImpl()
                             draw.firstIndex) *
                         RetainedIndexBytes(*command.cache)));
             }
+            // Packet end: the VAO's static raw-ST source and the flush-entry
+            // alpha test come back before the next packet or shadow.
+            if (chromeCache)
+            {
+                BindStaticRawSt(*chromeCache);
+                chromeCache = nullptr;
+            }
+            if (maskedActive)
+            {
+                EndFlushMasked(
+                    previousAlphaTest, previousAlphaFunc,
+                    previousAlphaRef);
+                maskedActive = false;
+            }
         }
         submitted = true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         submitted = false;
+    }
+
+    // A faulted submission may have left a packet's material state applied.
+    if (chromeCache)
+    {
+        __try
+        {
+            g_bindVertexArray(chromeCache->vertexArray);
+            BindStaticRawSt(*chromeCache);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        chromeCache = nullptr;
+    }
+    if (maskedActive)
+    {
+        __try
+        {
+            EndFlushMasked(
+                previousAlphaTest, previousAlphaFunc, previousAlphaRef);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        maskedActive = false;
+    }
+    if (runHasChrome)
+    {
+        __try
+        {
+            g_bindBuffer(
+                GL_ARRAY_BUFFER,
+                static_cast<unsigned>(previousArrayBuffer));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     RestoreFlushEntryState(entry);
@@ -7458,6 +7936,9 @@ bool FlushDeferredSolidCommandsImpl()
     g_deferredShadows.clear();
     g_deferredMeshes.clear();
     g_deferredBoneFloats.clear();
+    g_deferredChromeUvs.clear();
+    g_deferredChromeStreamBytes = 0;
+    g_deferredRunHasMasked = false;
     g_deferredOrder.clear();
     g_deferredGroups.clear();
     g_deferredRunMatricesValid = false;
@@ -7517,6 +7998,8 @@ bool FlushDeferredSolidCommands(FlushSite site, FlushTrigger trigger)
     const long long start = prof::Now();
     const bool flushed = FlushDeferredSolidCommandsImpl();
     const long long elapsed = prof::Now() - start;
+    g_profiledFlushTicks += elapsed;
+    ++g_profiledFlushCount;
     ++g_flushProfile.flushes;
     ++g_flushProfile.siteFlushes[static_cast<unsigned>(trigger)];
     g_flushProfile.records += records;
@@ -7683,7 +8166,7 @@ bool TryDirectDraw(void* wrapperCaller)
     }
     catch (...)
     {
-        return DirectFallback(DirectFallbackReason::Material);
+        return MaterialFallback(MaterialReject::Reserve);
     }
     bool flatLightKnown[2]{};
     float flatLightValue[2] = {1.0f, 1.0f};
@@ -7693,12 +8176,15 @@ bool TryDirectDraw(void* wrapperCaller)
     for (const RetainedSubmesh& mesh : submodel.meshes)
     {
         DirectMaterial material{};
+        MaterialReject materialReject = MaterialReject::Count;
         if (!ResolveDirectMaterial(
-                textureHeader, skinFamily, mesh, material) ||
-            mesh.indexCount == 0 ||
-            mesh.indexCount > static_cast<std::uint32_t>(INT_MAX) ||
-            mesh.lastVertex >= cache->vertices.size())
-            return DirectFallback(DirectFallbackReason::Material);
+                textureHeader, skinFamily, mesh, material, materialReject))
+            return MaterialFallback(materialReject);
+        if (mesh.indexCount == 0 ||
+            mesh.indexCount > static_cast<std::uint32_t>(INT_MAX))
+            return MaterialFallback(MaterialReject::IndexCount);
+        if (mesh.lastVertex >= cache->vertices.size())
+            return MaterialFallback(MaterialReject::LastVertex);
         // Gold's R_StudioLighting (hw+0x96B50) returns before the FLATSHADE
         // and normal paths when the mesh is FULLBRIGHT and the current entity
         // is not a player: it stores exactly 1.0f and skips the lightgamma
@@ -7723,7 +8209,7 @@ bool TryDirectDraw(void* wrapperCaller)
                         static_cast<int>(sample.normalBone),
                         static_cast<int>(material.flags),
                         sample.normal))
-                    return DirectFallback(DirectFallbackReason::Material);
+                    return MaterialFallback(MaterialReject::FlatLight);
                 flatLightKnown[flatVariant] = true;
             }
             material.flatLight = flatLightValue[flatVariant];
@@ -7741,7 +8227,7 @@ bool TryDirectDraw(void* wrapperCaller)
         catch (...)
         {
             g_preparedMeshes.clear();
-            return DirectFallback(DirectFallbackReason::Material);
+            return MaterialFallback(MaterialReject::Store);
         }
     }
 
@@ -7759,14 +8245,12 @@ bool TryDirectDraw(void* wrapperCaller)
         !UploadGpu(*cache))
         return DirectFallback(DirectFallbackReason::ProgramGpu);
 
-    if (hasChrome && !EnsureChromeUvBuffer(*cache))
-        return DirectFallback(DirectFallbackReason::ProgramGpu);
-
     if (!StampUsedPositionBones(submodel))
         return DirectFallback(DirectFallbackReason::BoneStamp);
 
+    bool chromePrepared = false;
     if (RecordDeferredDirectDraw(
-            state, *cache, submodel))
+            state, *cache, submodel, chromePrepared))
     {
         if (nonPlayerPhase1)
             ++g_nonPlayerDeferredDraws;
@@ -7779,16 +8263,25 @@ bool TryDirectDraw(void* wrapperCaller)
     // rather than widening coverage through the immediate retained path. The
     // fallback barrier in DirectKernelDispatch orders that stock draw.
     if (nonPlayerPhase1)
+    {
+        if (prof::Active())
+            ++g_executeNonPlayerRecord;
         return DirectFallback(DirectFallbackReason::Execute);
+    }
+
+    // The per-cache CHROME buffer is only used by the immediate path.
+    if (hasChrome && !EnsureChromeUvBuffer(*cache))
+        return DirectFallback(DirectFallbackReason::ProgramGpu);
 
     // A pending recorded run must become visible before an immediate retained
     // draw that is not order-independent of it. ADDITIVE meshes blend without
-    // depth writes. CHROME and MASKED-only entities (the usual reason the
-    // recorder declined) draw opaque or alpha-tested with depth writes, the
-    // same order-independent class as the pending packets. If the immediate
-    // draw fails, the stock replay is ordered by the fallback barrier. The
-    // immediate upload takes one block from the same frame region the flush
-    // will plan from, so the pending run must still fit after it.
+    // depth writes. CHROME and MASKED-only entities that the recorder still
+    // declined (remap textures, capacity) draw opaque or alpha-tested with
+    // depth writes, the same order-independent class as the pending packets.
+    // If the immediate draw fails, the stock replay is ordered by the
+    // fallback barrier. The immediate upload takes one block from the same
+    // frame region the flush will plan from, so the pending run must still
+    // fit after it.
     if (!g_deferredCommands.empty())
     {
         if (!hasAdditive && PendingRunAdmitsForeignDraw() &&
@@ -7804,10 +8297,14 @@ bool TryDirectDraw(void* wrapperCaller)
     {
         // Preserve Gold's mesh-order R_StudioChrome calls and chromeage/basis
         // side effects, then upload only the selected submodel's contiguous UV
-        // range. CHROME stays immediate-only, deferred rejected it above.
-        if (!PrepareChromeCoordinates(state, *cache, submodel) ||
-            !UploadChromeCoordinates(*cache, submodel))
-            return DirectFallback(DirectFallbackReason::Material);
+        // range. A recorder that declined after its own prepass already left
+        // the exact coordinates in g_chromeCoords/g_chromeUvScratch, nothing
+        // that runs in between (flush, barrier) touches them.
+        if (!chromePrepared &&
+            !PrepareChromeCoordinates(state, *cache, submodel))
+            return MaterialFallback(MaterialReject::ChromePrepare);
+        if (!UploadChromeCoordinates(*cache, submodel))
+            return MaterialFallback(MaterialReject::ChromeUpload);
     }
 
     const bool useVertexArray =
@@ -7839,7 +8336,11 @@ bool TryDirectDraw(void* wrapperCaller)
             previousVertexArray,
             previousArrayBuffer, previousElementBuffer,
             maxTextureUnits))
+    {
+        if (prof::Active())
+            ++g_executeImmediate;
         return DirectFallback(DirectFallbackReason::Execute);
+    }
 
     ++g_directDraws;
     return true;
@@ -7854,6 +8355,8 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
     const bool collectTiming = prof::Active();
     const long long attemptStart =
         collectTiming ? prof::Now() : 0;
+    const long long flushTicksStart = g_profiledFlushTicks;
+    const std::uint64_t flushCountStart = g_profiledFlushCount;
     const bool direct = TryDirectDraw(wrapperCaller);
     if (g_directProgramOwned)
     {
@@ -7875,7 +8378,17 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
     }
     if (collectTiming)
     {
-        const long long elapsed = prof::Now() - attemptStart;
+        // Flushes run from here submit the pending run of other entities and
+        // replay its deferred shadows. Charging them to this draw made
+        // directTotal grow with run length (6.0 -> 8.5 us once shadows stopped
+        // ending runs), so they are reported separately.
+        const long long flushTicks =
+            g_profiledFlushTicks - flushTicksStart;
+        g_directTiming.dispatchFlushTicks += flushTicks;
+        g_directTiming.dispatchFlushes +=
+            g_profiledFlushCount - flushCountStart;
+        const long long elapsed =
+            prof::Now() - attemptStart - flushTicks;
         if (direct)
         {
             g_directTiming.directAttemptTicks += elapsed;
@@ -7895,7 +8408,7 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
     if ((g_directAttempts & 0xFFFu) == 0 && rendererlog::StatsEnabled())
     {
         rendererlog::Line(
-            "studio renderer: direct attempts=%llu draws=%llu fallback=%llu coverage=%.1f%% deferred=%llu flushed=%llu pending=%u uboMap=%llu uboSub=%llu colorSkip=%llu paramsSkip=%llu instDraw=%llu instEnt=%llu instSaved=%llu progFix=%llu chrome=%llu chromeNormals=%llu",
+            "studio renderer: direct attempts=%llu draws=%llu fallback=%llu coverage=%.1f%% deferred=%llu flushed=%llu pending=%u uboMap=%llu uboSub=%llu colorSkip=%llu paramsSkip=%llu instDraw=%llu instEnt=%llu instSaved=%llu progFix=%llu chrome=%llu chromeNormals=%llu deferredChrome=%llu deferredMasked=%llu",
             static_cast<unsigned long long>(g_directAttempts),
             static_cast<unsigned long long>(g_directDraws),
             static_cast<unsigned long long>(g_directFallbacks),
@@ -7915,9 +8428,57 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
             static_cast<unsigned long long>(g_instancedSavedDraws),
             static_cast<unsigned long long>(g_forcedProgramRestores),
             static_cast<unsigned long long>(g_chromePrepasses),
-            static_cast<unsigned long long>(g_chromeNormalCalls));
+            static_cast<unsigned long long>(g_chromeNormalCalls),
+            static_cast<unsigned long long>(g_deferredChromeRecords),
+            static_cast<unsigned long long>(g_deferredMaskedRecords));
         if (prof::Active())
         {
+            char materialRejects[320]{};
+            std::size_t materialUsed = 0;
+            for (unsigned i = 0;
+                 i < static_cast<unsigned>(MaterialReject::Count) &&
+                 materialUsed < sizeof(materialRejects);
+                 ++i)
+            {
+                const int written = std::snprintf(
+                    materialRejects + materialUsed,
+                    sizeof(materialRejects) - materialUsed,
+                    " %s=%llu", kMaterialRejectNames[i],
+                    static_cast<unsigned long long>(g_materialReject[i]));
+                if (written <= 0)
+                    break;
+                materialUsed += static_cast<std::size_t>(written);
+            }
+            rendererlog::Line(
+                "studio renderer: material rejects%s; execute "
+                "nonplayerRecord=%llu immediate=%llu",
+                materialRejects,
+                static_cast<unsigned long long>(g_executeNonPlayerRecord),
+                static_cast<unsigned long long>(g_executeImmediate));
+            for (unsigned side = 0; side < 2u; ++side)
+            {
+                char recordRejects[400]{};
+                std::size_t recordUsed = 0;
+                for (unsigned i = 0;
+                     i < static_cast<unsigned>(RecordReject::Count) &&
+                     recordUsed < sizeof(recordRejects);
+                     ++i)
+                {
+                    const int written = std::snprintf(
+                        recordRejects + recordUsed,
+                        sizeof(recordRejects) - recordUsed,
+                        " %s=%llu", kRecordRejectNames[i],
+                        static_cast<unsigned long long>(
+                            g_recordReject[side][i]));
+                    if (written <= 0)
+                        break;
+                    recordUsed += static_cast<std::size_t>(written);
+                }
+                rendererlog::Line(
+                    "studio renderer: record rejects %s:%s",
+                    side == 0 ? "player" : "nonplayer",
+                    recordRejects);
+            }
             rendererlog::Line(
                 "studio renderer: nonplayer phase1 attempts=%llu deferred=%llu",
                 static_cast<unsigned long long>(g_nonPlayerAttempts),
@@ -7994,7 +8555,8 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
                 "studio renderer: direct timing us/call "
                 "state=%.3f uniforms=%.3f uboUpload=%.3f uboBind=%.3f "
                 "material=%.3f draw=%.3f restore=%.3f directTotal=%.3f "
-                "fallbackPreflight=%.3f",
+                "fallbackPreflight=%.3f (flush time excluded) "
+                "dispatchFlush=%.3f us x %llu",
                 TimingMicrosPerCall(
                     g_directTiming.stateTicks,
                     g_directTiming.stateCalls),
@@ -8021,7 +8583,12 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
                     g_directTiming.directAttemptCalls),
                 TimingMicrosPerCall(
                     g_directTiming.fallbackAttemptTicks,
-                    g_directTiming.fallbackAttemptCalls));
+                    g_directTiming.fallbackAttemptCalls),
+                TimingMicrosPerCall(
+                    g_directTiming.dispatchFlushTicks,
+                    g_directTiming.dispatchFlushes),
+                static_cast<unsigned long long>(
+                    g_directTiming.dispatchFlushes));
             rendererlog::Line(
                 "studio renderer: ubo mode=%s persistentWrites=%llu "
                 "fenceWaits=%llu",
@@ -8574,12 +9141,19 @@ void LogFlushProfile()
     }
     rendererlog::Line(
         "studio renderer: deferred shadows/frame=%.2f replayed=%llu "
-        "replayFail=%llu envFix=%llu matrixLoad=%llu",
+        "replayFail=%llu envFix=%llu matrixLoad=%llu replayMs/frame=%.4f",
         static_cast<double>(stats.shadowsDeferred) / frames,
         static_cast<unsigned long long>(stats.shadowsReplayed),
         static_cast<unsigned long long>(stats.shadowReplayFailures),
         static_cast<unsigned long long>(stats.shadowEnvFixes),
-        static_cast<unsigned long long>(stats.shadowMatrixLoads));
+        static_cast<unsigned long long>(stats.shadowMatrixLoads),
+        static_cast<double>(stats.shadowReplayTicks) * ticksToMs / frames);
+    rendererlog::Line(
+        "studio renderer: deferred chrome/frame=%.2f masked/frame=%.2f "
+        "chromeStreamKB/frame=%.1f",
+        static_cast<double>(stats.chromeRecords) / frames,
+        static_cast<double>(stats.maskedRecords) / frames,
+        static_cast<double>(stats.chromeStreamBytes) / 1024.0 / frames);
     rendererlog::Line(
         "studio renderer: deferred flushes/frame=%.2f records/flush=%.2f "
         "maxRecords=%llu groups/flush=%.2f instGroups/frame=%.2f "
