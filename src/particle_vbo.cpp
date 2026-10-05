@@ -490,6 +490,13 @@ unsigned char ColorByte(float value)
 
 void WINAPI ParticleBegin(unsigned mode)
 {
+    // Disabled: skip the particle-list walk and slot checks entirely.
+    if (!g_enabled || !rendererperf::Enabled())
+    {
+        if (auto live = ReadQgl<GlBeginFn>(kQglBeginRva))
+            live(mode);
+        return;
+    }
     const CallbackGuardResult guard = ParticleCallbacksRequireStock();
     const bool slotsStable = GlSlotsStable();
     bool buffersReady = false;

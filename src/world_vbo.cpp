@@ -5,6 +5,7 @@
 #include "perf_control.h"
 #include "profile.h"
 #include "studio_drawbatch.h"
+#include "vis_cache.h"
 
 #include <windows.h>
 #include <cstdint>
@@ -905,11 +906,28 @@ bool EnsureCache()
         world == g_world && surfaces == g_surfaces && count == g_numSurfaces)
         return true;
 
+    // A failed build would otherwise be retried (and logged) on every world
+    // and brush scope. Retry the same map at most once every 5 seconds.
+    static std::uint8_t* failedWorld = nullptr;
+    static std::uint32_t failedGeneration = 0;
+    static DWORD failedTick = 0;
+    if (failedWorld == world && failedGeneration == g_mapGeneration &&
+        !g_contextLost && GetTickCount() - failedTick < 5000u)
+        return false;
+
     if (g_contextLost)
         ForgetGpuBuffer(false);
     else if (g_vbo)
         ForgetGpuBuffer(true);
-    return BuildCache();
+    if (BuildCache())
+    {
+        failedWorld = nullptr;
+        return true;
+    }
+    failedWorld = world;
+    failedGeneration = g_mapGeneration;
+    failedTick = GetTickCount();
+    return false;
 }
 
 bool __cdecl DrawPreparedSequential();
@@ -1706,6 +1724,8 @@ void __cdecl NewMap_Hook()
     if (g_mapGeneration == 0)
         g_mapGeneration = 1;
     g_dirty = true;
+    // The new world can reuse the old model pointer; drop cached leaves.
+    viscache::BeginFrame();
     g_newMap();
 }
 
@@ -1782,7 +1802,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
 
     __try
     {
-        g_cvar = engine->pfnRegisterVariable("r_world_vbo", "1", 0);
+        g_cvar = engine->pfnRegisterVariable("r_world_vbo", "0", 0);
         g_brushCvar =
             engine->pfnRegisterVariable("r_world_brush_vbo", "1", 0);
     }
@@ -1966,9 +1986,7 @@ void BeginBrushScope()
         !rendererperf::Enabled() ||
         *reinterpret_cast<int*>(g_hwBase + kTextureSortModeRva) != 0)
         return;
-    if (!EnsureCache() || !g_clientActiveTexture ||
-        !PolygonFillMode() ||
-        !ForeignClientArraysClear(2))
+    if (!EnsureCache() || !g_clientActiveTexture)
         return;
 
     // The exact solid brush caller has already assigned currententity. Restrict
@@ -1986,6 +2004,9 @@ void BeginBrushScope()
     if (firstSurface < 0 || surfaceCount <= 0 ||
         firstSurface > g_numSurfaces ||
         surfaceCount > g_numSurfaces - firstSurface)
+        return;
+    // GL state queries last: they are the expensive checks.
+    if (!PolygonFillMode() || !ForeignClientArraysClear(2))
         return;
 
     g_brushPreviousArrayBuffer = 0;

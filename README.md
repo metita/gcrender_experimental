@@ -48,7 +48,7 @@ The table below lists every CVAR registered by GCRender. The status describes th
 | --- | ---: | --- | --- |
 | `r_fastpath` | `1` | **Default/on** | Master switch for the optimized renderer paths. `0` keeps hooks installed but routes them through pass-through behavior for direct A/B tests. |
 | `r_profile` | `0` | **Diagnostic** | Enables frame/phase profiling and periodic reports. While enabled, log output is buffered in RAM and flushed to `gcrender.log` when profiling is disabled, avoiding filesystem I/O during the measured frames. |
-| `r_world_vbo` | `1` | **Default/on** | Uses retained BSP world VBO/EBO rendering to reduce repeated immediate-mode geometry submission and GL call overhead. |
+| `r_world_vbo` | `0` | **Experimental/off** | Retained BSP world VBO/EBO rendering. Off by default: the sequential path still issues one draw per surface, so it cannot beat immediate mode, and the paired A/B measured the world phase slower with it on. |
 | `r_world_brush_vbo` | `1` | **Default/on** | Uses the VBO path for brush-model world geometry, reducing repeated CPU-side vertex submission. |
 | `r_particle_vbo` | `1` | **Default/on** | Streams particle geometry through a VBO instead of issuing the original immediate-mode vertex sequence. |
 | `r_beam_vbo` | `1` | **Default/on** | Batches supported beam geometry into a streaming VBO, reducing `glBegin`/per-vertex call overhead. |

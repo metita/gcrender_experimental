@@ -150,6 +150,7 @@ constexpr unsigned GL_FLAT = 0x1D00u;
 constexpr unsigned GL_SMOOTH = 0x1D01u;
 constexpr unsigned GL_MAP_WRITE_BIT = 0x0002u;
 constexpr unsigned GL_MAP_INVALIDATE_RANGE_BIT = 0x0004u;
+constexpr unsigned GL_MAP_UNSYNCHRONIZED_BIT = 0x0020u;
 constexpr unsigned GL_MAP_INVALIDATE_BUFFER_BIT = 0x0008u;
 constexpr unsigned GL_MAP_FLUSH_EXPLICIT_BIT = 0x0010u;
 constexpr unsigned GL_INVALID_INDEX = 0xFFFFFFFFu;
@@ -581,7 +582,9 @@ unsigned g_boneBlockIndex = GL_INVALID_INDEX;
 unsigned g_boneBlockBinding = 0;
 
 constexpr int kUniformBufferCount = 3;
-constexpr std::size_t kUniformBufferBytes = 1u << 19;
+// 4 MB per ring buffer = 512 bone blocks of 8 KB. The former 512 KB held only
+// 64 commands per frame, after which crowded scenes fell back to stock.
+constexpr std::size_t kUniformBufferBytes = 1u << 22;
 constexpr std::size_t kBoneBlockBytes =
     384u * sizeof(float) * 4u +
     128u * sizeof(float) * 4u;
@@ -5598,8 +5601,11 @@ bool FlushDeferredSolidCommands()
                     GL_UNIFORM_BUFFER,
                     static_cast<std::ptrdiff_t>(mapStart),
                     static_cast<std::ptrdiff_t>(mapBytes),
+                    // The buffer is orphaned once per frame and ranges are
+                    // never rewritten within a frame, so no GPU sync is needed.
                     GL_MAP_WRITE_BIT |
-                        GL_MAP_INVALIDATE_RANGE_BIT);
+                        GL_MAP_INVALIDATE_RANGE_BIT |
+                        GL_MAP_UNSYNCHRONIZED_BIT);
                 if (mapped)
                 {
                     bool copyOk = true;
