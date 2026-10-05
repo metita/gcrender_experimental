@@ -89,6 +89,13 @@ constexpr std::uintptr_t kGoldCurrentTmuRva = 0x027E35E0u;
 // Solid R_DrawSpriteModel inputs, same addresses as sprite_vbo's capture gate.
 constexpr std::uintptr_t kSpriteTextureMatrixRva = 0x0078F944u;
 constexpr std::uintptr_t kSpriteBlendRva = 0x0333A008u;
+constexpr std::uintptr_t kQglDepthFuncRva = 0x027E37D8u;
+// Gold-visible globals written by StudioRenderShadow (hw+0x9D7A0) through the
+// triangle API: tri render mode, tri color (r,g,b,a stored downwards from
+// +0x58B0) and the VGUI2 current-texture reset done by tri Begin.
+constexpr std::uintptr_t kTriRenderModeRva = 0x029F58D0u;
+constexpr std::uintptr_t kTriColorRva = 0x029F58A4u;
+constexpr std::uintptr_t kVguiCurrentTextureRva = 0x0333B850u;
 
 constexpr unsigned GL_ARRAY_BUFFER = 0x8892u;
 constexpr unsigned GL_ELEMENT_ARRAY_BUFFER = 0x8893u;
@@ -167,6 +174,18 @@ constexpr unsigned GL_MAJOR_VERSION = 0x821Bu;
 constexpr unsigned GL_MINOR_VERSION = 0x821Cu;
 constexpr unsigned GL_EXTENSIONS = 0x1F03u;
 constexpr unsigned GL_DEPTH_TEST = 0x0B71u;
+constexpr unsigned GL_DEPTH_FUNC = 0x0B74u;
+constexpr unsigned GL_FOG = 0x0B60u;
+constexpr unsigned GL_STENCIL_TEST = 0x0B90u;
+constexpr unsigned GL_POLYGON_OFFSET_FILL = 0x8037u;
+constexpr unsigned GL_BLEND_DST = 0x0BE0u;
+constexpr unsigned GL_BLEND_SRC = 0x0BE1u;
+constexpr unsigned GL_CURRENT_COLOR = 0x0B00u;
+constexpr unsigned GL_CURRENT_TEXTURE_COORDS = 0x0B03u;
+constexpr unsigned GL_MATRIX_MODE = 0x0BA0u;
+constexpr unsigned GL_MODELVIEW = 0x1700u;
+constexpr unsigned GL_PROJECTION = 0x1701u;
+constexpr unsigned GL_TEXTURE = 0x1702u;
 constexpr unsigned GL_INVALID_INDEX = 0xFFFFFFFFu;
 constexpr unsigned char GL_FALSE_VALUE = 0;
 
@@ -203,6 +222,15 @@ using GlDrawElementsInstancedFn = void (WINAPI*)(
     unsigned mode, int count, unsigned type,
     const void* indices, int instanceCount);
 using GlCullFaceFn = void (WINAPI*)(unsigned mode);
+using GlDepthFuncFn = void (WINAPI*)(unsigned func);
+using GlMatrixModeFn = void (WINAPI*)(unsigned mode);
+using GlPushMatrixFn = void (WINAPI*)();
+using GlPopMatrixFn = void (WINAPI*)();
+using GlLoadMatrixfFn = void (WINAPI*)(const float* matrix);
+using GlTexCoord4fvFn = void (WINAPI*)(const float* coords);
+// Client StudioRenderShadow provider: (sprite index, p1, p2, p3, p4).
+using RenderShadowFn = void (__cdecl*)(int sprite, float* p1, float* p2,
+                                       float* p3, float* p4);
 using GlEnableFn = void (WINAPI*)(unsigned cap);
 using GlDisableFn = void (WINAPI*)(unsigned cap);
 using GlIsEnabledFn = unsigned char (WINAPI*)(unsigned cap);
@@ -470,6 +498,7 @@ cvar_t* g_mode = nullptr;
 cvar_t* g_nonPlayerMode = nullptr;
 cvar_t* g_meshoptMode = nullptr;
 cvar_t* g_instancingMode = nullptr;
+cvar_t* g_shadowDeferMode = nullptr;
 cl_enginefunc_t* g_entryEngine = nullptr;
 std::unordered_map<const std::uint8_t*, RetainedCache> g_caches;
 std::unordered_map<const StudioHeaderRaw*, std::uint64_t>
@@ -494,6 +523,12 @@ GlGetTexEnvivFn g_getTexEnviv = nullptr;
 GlDrawElementsFn g_drawElements = nullptr;
 GlDrawElementsInstancedFn g_drawElementsInstanced = nullptr;
 GlCullFaceFn g_cullFace = nullptr;
+GlDepthFuncFn g_depthFunc = nullptr;
+GlMatrixModeFn g_matrixMode = nullptr;
+GlPushMatrixFn g_pushMatrix = nullptr;
+GlPopMatrixFn g_popMatrix = nullptr;
+GlLoadMatrixfFn g_loadMatrixf = nullptr;
+GlTexCoord4fvFn g_texCoord4fv = nullptr;
 GlEnableFn g_enable = nullptr;
 GlDisableFn g_disable = nullptr;
 GlIsEnabledFn g_isEnabled = nullptr;
@@ -739,6 +774,42 @@ std::uint64_t g_globalRejectReason[
     static_cast<unsigned>(GlobalRejectReason::Count)]{};
 std::uint64_t g_setupModeRejectValues[16]{};
 std::uint64_t g_setupModeRejectOther = 0;
+
+// Profiling breakdown of GlobalRejectReason::NotPlayer. DrawModelScope is
+// further split by the first DrawModelEntryCompatible check that failed.
+enum class NonPlayerReject : unsigned
+{
+    OutsidePass,
+    DrawModelScope,
+    GlowShell,
+    Other,
+    Count
+};
+
+enum class DrawModelEntryReject : unsigned
+{
+    Flags,
+    Mode,
+    Caller,
+    DrawEntities,
+    Entity,
+    RenderMode,
+    GlowShell,
+    ForceFlags,
+    Count
+};
+
+std::uint64_t g_nonPlayerReject[
+    static_cast<unsigned>(NonPlayerReject::Count)]{};
+std::uint64_t g_drawModelEntryReject[
+    static_cast<unsigned>(DrawModelEntryReject::Count)]{};
+
+bool DrawModelEntryFallback(DrawModelEntryReject reason)
+{
+    if (prof::Active())
+        ++g_drawModelEntryReject[static_cast<unsigned>(reason)];
+    return false;
+}
 
 bool GlobalFallback(GlobalRejectReason reason)
 {
@@ -1013,6 +1084,18 @@ bool RefreshGlFunctions()
                 GetGlProc("glDrawElementsInstancedARB"));
     }
     g_cullFace = ReadQgl<GlCullFaceFn>(kQglCullFaceRva);
+    // Optional, used only by the deferred client shadow replay.
+    g_depthFunc = ReadQgl<GlDepthFuncFn>(kQglDepthFuncRva);
+    g_matrixMode =
+        reinterpret_cast<GlMatrixModeFn>(GetGlProc("glMatrixMode"));
+    g_pushMatrix =
+        reinterpret_cast<GlPushMatrixFn>(GetGlProc("glPushMatrix"));
+    g_popMatrix =
+        reinterpret_cast<GlPopMatrixFn>(GetGlProc("glPopMatrix"));
+    g_loadMatrixf =
+        reinterpret_cast<GlLoadMatrixfFn>(GetGlProc("glLoadMatrixf"));
+    g_texCoord4fv =
+        reinterpret_cast<GlTexCoord4fvFn>(GetGlProc("glTexCoord4fv"));
     g_enable = ReadQgl<GlEnableFn>(kQglEnableRva);
     g_disable = ReadQgl<GlDisableFn>(kQglDisableRva);
     g_isEnabled = ReadQgl<GlIsEnabledFn>(kQglIsEnabledRva);
@@ -1213,6 +1296,14 @@ int ReadInstancingMode()
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
+int ReadShadowDeferMode()
+{
+    if (!g_shadowDeferMode)
+        return 0;
+    __try { return static_cast<int>(g_shadowDeferMode->value); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 bool ReadExactRDrawEntitiesNormal()
 {
     if (!g_entryEngine || !g_entryEngine->pfnGetCvarFloat)
@@ -1229,46 +1320,60 @@ bool ReadExactRDrawEntitiesNormal()
 
 bool DrawModelEntryCompatible(int flags, void* caller)
 {
-    if (flags != 3 ||
-        ReadMode() != 1 ||
+    if (flags != 3)
+        return DrawModelEntryFallback(DrawModelEntryReject::Flags);
+    if (ReadMode() != 1 ||
         ReadNonPlayerMode() != 1 ||
         !g_deferredBarriersReady ||
         !g_clientStudioShadowBarrierReady ||
         g_solidEntityPassDepth <= 0 ||
-        !g_hwBase ||
-        caller != g_hwBase + kSolidDrawModelReturnRva ||
-        !ReadExactRDrawEntitiesNormal())
-        return false;
+        !g_hwBase)
+        return DrawModelEntryFallback(DrawModelEntryReject::Mode);
+    if (caller != g_hwBase + kSolidDrawModelReturnRva)
+        return DrawModelEntryFallback(DrawModelEntryReject::Caller);
+    if (!ReadExactRDrawEntitiesNormal())
+        return DrawModelEntryFallback(DrawModelEntryReject::DrawEntities);
 
+    DrawModelEntryReject reject = DrawModelEntryReject::Count;
     __try
     {
         std::uint8_t* const entity =
             *reinterpret_cast<std::uint8_t**>(
                 g_hwBase + kCurrentEntityRva);
-        if (!entity ||
-            *reinterpret_cast<const int*>(entity + 4) != 0)
-            return false;
-
         const std::uint8_t* const model =
-            *reinterpret_cast<std::uint8_t* const*>(
-                entity + 0xB94);
-        if (!model ||
+            entity
+                ? *reinterpret_cast<std::uint8_t* const*>(
+                      entity + 0xB94)
+                : nullptr;
+        // Inside Gold's DrawPoints only renderfx 19 (glow shell: normal
+        // inflation, forced CHROME, ONE/ONE second pass) changes the output.
+        // Every other renderfx (kRenderFxDeadPlayer corpses, NoDissipation,
+        // LightMultiplier, ...) only feeds client/lighting code that runs
+        // before DrawPoints and is captured there like for players.
+        // MOVETYPE_FOLLOW/aiment entities reach DrawPoints with Gold's
+        // already-merged bone transforms and setup lighting, which the
+        // recorder copies at that point exactly like any other entity. Their
+        // parent's setup-only DrawModel/DrawPlayer(0) emits nothing.
+        if (!entity ||
+            *reinterpret_cast<const int*>(entity + 4) != 0 ||
+            !model ||
             *reinterpret_cast<const int*>(model + 0x44) != 3)
-            return false;
-
-        if (*reinterpret_cast<const int*>(entity + 0x2F8) != 0 ||
-            *reinterpret_cast<const int*>(entity + 0x304) != 0 ||
-            *reinterpret_cast<const int*>(entity + 0x308) == 12 ||
-            *reinterpret_cast<const int*>(entity + 0x344) != 0 ||
-            *reinterpret_cast<const std::uint32_t*>(
-                g_hwBase + kForceFaceFlagsRva) != 0)
-            return false;
-        return true;
+            reject = DrawModelEntryReject::Entity;
+        else if (*reinterpret_cast<const int*>(entity + 0x2F8) != 0)
+            reject = DrawModelEntryReject::RenderMode;
+        else if (*reinterpret_cast<const int*>(entity + 0x304) == 19)
+            reject = DrawModelEntryReject::GlowShell;
+        else if (*reinterpret_cast<const std::uint32_t*>(
+                     g_hwBase + kForceFaceFlagsRva) != 0)
+            reject = DrawModelEntryReject::ForceFlags;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        return false;
+        reject = DrawModelEntryReject::Entity;
     }
+    if (reject != DrawModelEntryReject::Count)
+        return DrawModelEntryFallback(reject);
+    return true;
 }
 
 bool ReleaseOwnedDirectProgram()
@@ -2769,6 +2874,10 @@ struct DirectMaterial
     float sScale = 0.0f;
     float tScale = 0.0f;
     float flatLight = 1.0f;
+    // The mesh lighting scalar does not depend on the vertex normal: Gold's
+    // FLATSHADE meshes and its non-player FULLBRIGHT shortcut. The shader
+    // then uses flatLight, sampled from the stock R_StudioLighting.
+    bool constantLight = false;
     bool directBind = false;
 };
 
@@ -2832,6 +2941,7 @@ struct DeferredMeshDraw
     float sScale = 0.0f;
     float tScale = 0.0f;
     float flatLight = 1.0f;
+    bool constantLight = false;
 };
 
 struct DeferredStudioCommand
@@ -2849,6 +2959,9 @@ struct DeferredStudioCommand
     unsigned char mirror = 0;
     int rendererType = 1;
     std::size_t bucket = 0;
+    // Number of client shadows deferred before this packet was recorded.
+    // Packets of different segments are never reordered across a shadow.
+    std::size_t segment = 0;
 };
 
 // One flush draw group. count == 1 replays a command through the ordinary
@@ -2862,7 +2975,36 @@ struct DeferredDrawGroup
     std::size_t recordsPerInstance = 0;
 };
 
+// Fixed-function state a client shadow consumes without setting it itself.
+// StudioRenderShadow sets blend, blend func, TMU0 env/binding, shade model,
+// depth mask and color through the triangle API; everything below is
+// inherited from the caller and is reproduced at replay.
+struct ShadowEnv
+{
+    unsigned char cull = 0;
+    unsigned char depthTest = 0;
+    unsigned char alphaTest = 0;
+    unsigned char fog = 0;
+    unsigned char stencil = 0;
+    unsigned char polygonOffset = 0;
+    int cullMode = 0;
+    int depthFunc = 0;
+    int alphaFunc = 0;
+    float alphaRef = 0.0f;
+};
+
+// One client StudioRenderShadow call taken out of the solid entity pass and
+// replayed by the flush exactly between the packets it originally separated.
+struct DeferredShadow
+{
+    RenderShadowFn provider = nullptr;
+    int sprite = 0;
+    float points[4][3]{};
+    ShadowEnv env{};
+};
+
 std::vector<DeferredStudioCommand> g_deferredCommands;
+std::vector<DeferredShadow> g_deferredShadows;
 std::vector<DeferredMeshDraw> g_deferredMeshes;
 std::vector<float> g_deferredBoneFloats;
 std::vector<std::size_t> g_deferredOrder;
@@ -2925,6 +3067,11 @@ struct FlushProfileStats
     std::uint64_t instancedGroups = 0;
     std::uint64_t matrixVerifies = 0;
     std::uint64_t matrixMismatches = 0;
+    std::uint64_t shadowsDeferred = 0;
+    std::uint64_t shadowsReplayed = 0;
+    std::uint64_t shadowEnvFixes = 0;
+    std::uint64_t shadowMatrixLoads = 0;
+    std::uint64_t shadowReplayFailures = 0;
     long long ticks = 0;
     long long chargedTicks = 0;
 };
@@ -2953,6 +3100,7 @@ bool DeferredCommandsShareInstanceKey(
         !first.submodel || first.submodel != second.submodel ||
         first.rendererType != second.rendererType ||
         first.mirror != second.mirror ||
+        first.segment != second.segment ||
         first.meshCount != second.meshCount ||
         first.boneFloatCount != second.boneFloatCount ||
         first.meshFirst > g_deferredMeshes.size() ||
@@ -2972,6 +3120,7 @@ bool DeferredCommandsShareInstanceKey(
             a.indexCount != b.indexCount ||
             a.glId != b.glId ||
             a.flags != b.flags ||
+            a.constantLight != b.constantLight ||
             a.sScale != b.sScale ||
             a.tScale != b.tScale)
             return false;
@@ -3355,8 +3504,9 @@ bool SpriteDrawOrderIndependent()
 // Stock StudioDrawModel from the exact solid-pass callsite for a kRenderNormal
 // studio entity without fx or forced face flags. Its framebuffer output is
 // the hooked DrawPoints (each one re-evaluated by the fallback barrier) and
-// the client shadow (its own unconditional barrier, so the shadow hook must
-// be live). The glow-shell branch keeps its boundary flush in gl_state.
+// the client shadow (its own barrier, flushed or deferred in order, so the
+// shadow hook must be live). The glow-shell branch keeps its boundary flush
+// in gl_state.
 bool StockDrawModelOrderIndependent(int flags, void* caller)
 {
     if (flags != 3 ||
@@ -5470,7 +5620,7 @@ bool SetMaterialParams(const DirectGlobals& state,
 {
     if (!g_uniform4fv)
         return false;
-    const bool flatShade = (material.flags & 1u) != 0u;
+    const bool flatShade = material.constantLight;
     const float params[4] = {
         flatShade ? -material.sScale : material.sScale,
         material.tScale,
@@ -6049,6 +6199,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     command.shade = state.shade;
     command.mirror = mirror;
     command.rendererType = rendererType;
+    command.segment = g_deferredShadows.size();
 
     try
     {
@@ -6086,6 +6237,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
             draw.sScale = material.sScale;
             draw.tScale = material.tScale;
             draw.flatLight = material.flatLight;
+            draw.constantLight = material.constantLight;
 
             std::size_t lastPrepared = preparedIndex;
             while (lastPrepared + 1 <
@@ -6102,6 +6254,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
                     next.material.sScale != draw.sScale ||
                     next.material.tScale != draw.tScale ||
                     next.material.flatLight != draw.flatLight ||
+                    next.material.constantLight != draw.constantLight ||
                     SelectDrawFirstIndex(
                         *next.mesh, next.material) !=
                         draw.firstIndex + draw.indexCount ||
@@ -6354,6 +6507,363 @@ bool BuildDeferredDrawPlan(bool instancingReady,
     return true;
 }
 
+// Deferred client shadows (r_studio_shadowdefer 1).
+//
+// CS draws a blob shadow under every player through the engine's
+// StudioRenderShadow (client+AFE42 -> hw+0x9D7A0): tri RenderMode
+// kRenderTransAlpha (SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend, depth writes off,
+// MODULATE, smooth), color (0,0,0,1), the shadow sprite bound on TMU0, one
+// quad lying on the floor, then RenderMode kRenderNormal (blend off, depth
+// writes on, MODULATE, flat).
+//
+// Skipping the barrier would not be exact. The quad blends and writes no
+// depth, so its pixels depend on what is already in the framebuffer.
+// Wherever an opaque packet fragment lies behind the quad but in front of the
+// stored depth (a dropped weapon or another player's feet under the slightly
+// raised quad, a model below a ledge the quad overhangs), stock darkens that
+// packet only if it was drawn before the shadow. Depth testing resolves the
+// opposite case (packet in front of the quad) in either order, but not this
+// one, so neither "shadow now, earlier packets later" nor "all shadows after
+// the run" reproduces stock.
+//
+// The shadow draw itself is therefore deferred and replayed by the flush at
+// its original position between the packets recorded before and after it.
+// Packets are opaque and depth-written, shadows only blend, so both reach GL
+// in stock order with stock depth contents and the image is unchanged.
+// - At the original call the provider still runs, with all four corners at
+//   the eye point: a zero-area quad that also lies in front of the near
+//   plane of Gold's perspective projection emits no fragment, while every
+//   Gold-visible side effect (GL state, Gold's TMU/binding caches, tri API
+//   globals, the VGUI2 flush/texture reset of tri Begin) happens exactly
+//   where stock has it. The VGUI2 text batch only fills during VGUI paint,
+//   after the 3D view, so that flush has nothing to draw here.
+// - At replay the flush first returns GL to its barrier-entry state, then
+//   puts back what the shadow inherits from its caller as captured at the
+//   original call (ShadowEnv, program 0, TMU0, the pass matrices verified
+//   at that call) and calls the provider with the original sprite and
+//   corners. Everything the shadow leaves behind returns to the
+//   barrier-entry values afterwards, including blend func, current color,
+//   current texture coordinate and the tri API globals.
+// - While a shadow is pending, barriers in front of any other framebuffer
+//   draw always flush (PendingRunAdmitsForeignDraw), and instancing never
+//   groups packets across a shadow (DeferredStudioCommand::segment).
+bool PendingRunAdmitsForeignDraw()
+{
+    return g_deferredShadows.empty();
+}
+
+bool ShadowReplayFunctionsReady()
+{
+    return g_isEnabled && g_enable && g_disable && g_getIntegerv &&
+           g_getFloatv && g_cullFace && g_depthFunc && g_alphaFunc &&
+           g_blendFunc && g_color4f && g_texCoord4fv && g_activeTexture &&
+           g_useProgram && g_matrixMode && g_pushMatrix && g_popMatrix &&
+           g_loadMatrixf;
+}
+
+bool CaptureShadowEnv(ShadowEnv& env)
+{
+    env = {};
+    if (!g_isEnabled || !g_getIntegerv || !g_getFloatv)
+        return false;
+    __try
+    {
+        env.cull = g_isEnabled(GL_CULL_FACE) != 0 ? 1 : 0;
+        env.depthTest = g_isEnabled(GL_DEPTH_TEST) != 0 ? 1 : 0;
+        env.alphaTest = g_isEnabled(GL_ALPHA_TEST) != 0 ? 1 : 0;
+        env.fog = g_isEnabled(GL_FOG) != 0 ? 1 : 0;
+        env.stencil = g_isEnabled(GL_STENCIL_TEST) != 0 ? 1 : 0;
+        env.polygonOffset =
+            g_isEnabled(GL_POLYGON_OFFSET_FILL) != 0 ? 1 : 0;
+        g_getIntegerv(GL_CULL_FACE_MODE, &env.cullMode);
+        g_getIntegerv(GL_DEPTH_FUNC, &env.depthFunc);
+        g_getIntegerv(GL_ALPHA_TEST_FUNC, &env.alphaFunc);
+        g_getFloatv(GL_ALPHA_TEST_REF, &env.alphaRef);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+void SetShadowCap(unsigned cap, unsigned char enabled)
+{
+    if (enabled)
+        g_enable(cap);
+    else
+        g_disable(cap);
+}
+
+// Moves live GL state from `from` to `to`, touching only what differs.
+// Called inside the replay's SEH scope.
+unsigned TransitionShadowEnv(const ShadowEnv& from, const ShadowEnv& to)
+{
+    unsigned changes = 0;
+    if (from.cull != to.cull)
+    {
+        SetShadowCap(GL_CULL_FACE, to.cull);
+        ++changes;
+    }
+    if (from.depthTest != to.depthTest)
+    {
+        SetShadowCap(GL_DEPTH_TEST, to.depthTest);
+        ++changes;
+    }
+    if (from.alphaTest != to.alphaTest)
+    {
+        SetShadowCap(GL_ALPHA_TEST, to.alphaTest);
+        ++changes;
+    }
+    if (from.fog != to.fog)
+    {
+        SetShadowCap(GL_FOG, to.fog);
+        ++changes;
+    }
+    if (from.stencil != to.stencil)
+    {
+        SetShadowCap(GL_STENCIL_TEST, to.stencil);
+        ++changes;
+    }
+    if (from.polygonOffset != to.polygonOffset)
+    {
+        SetShadowCap(GL_POLYGON_OFFSET_FILL, to.polygonOffset);
+        ++changes;
+    }
+    if (from.cullMode != to.cullMode)
+    {
+        g_cullFace(static_cast<unsigned>(to.cullMode));
+        ++changes;
+    }
+    if (from.depthFunc != to.depthFunc)
+    {
+        g_depthFunc(static_cast<unsigned>(to.depthFunc));
+        ++changes;
+    }
+    if (from.alphaFunc != to.alphaFunc || from.alphaRef != to.alphaRef)
+    {
+        g_alphaFunc(static_cast<unsigned>(to.alphaFunc), to.alphaRef);
+        ++changes;
+    }
+    return changes;
+}
+
+bool InvokeShadowProvider(RenderShadowFn provider,
+                          int sprite,
+                          const float points[4][3])
+{
+    if (!provider)
+        return false;
+    // The provider takes non-const pointers; hand it private copies.
+    float corners[4][3];
+    std::memcpy(corners, points, sizeof(corners));
+    __try
+    {
+        provider(sprite, corners[0], corners[1], corners[2], corners[3]);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Flush entry state, queried once per flush and handed back to Gold by
+// RestoreFlushEntryState.
+struct FlushEntryState
+{
+    int program = 0;
+    int vao = 0;
+    int activeTexture = static_cast<int>(GL_TEXTURE0);
+    int texEnvMode = static_cast<int>(GL_REPLACE);
+    int shadeModel = static_cast<int>(GL_FLAT);
+    int texture0 = 0;
+    bool blend = false;
+    int depthWrite = 1;
+};
+
+void RestoreFlushEntryState(const FlushEntryState& entry)
+{
+    __try
+    {
+        g_bindBuffer(
+            GL_UNIFORM_BUFFER,
+            static_cast<unsigned>(
+                g_genericUniformRestore));
+        g_useProgram(
+            static_cast<unsigned>(
+                entry.program));
+        g_bindVertexArray(
+            static_cast<unsigned>(
+                entry.vao));
+        g_activeTexture(GL_TEXTURE0);
+        if (entry.texture0 > 0)
+            g_goldBind(0, entry.texture0);
+        else if (g_deferredEntryTextureValid)
+            g_goldBind(0, static_cast<int>(g_deferredEntryTexture));
+        g_texEnvi(
+            GL_TEXTURE_ENV,
+            GL_TEXTURE_ENV_MODE,
+            entry.texEnvMode);
+        g_shadeModel(
+            static_cast<unsigned>(entry.shadeModel));
+        if (entry.blend)
+            g_enable(GL_BLEND);
+        else
+            g_disable(GL_BLEND);
+        g_depthMask(entry.depthWrite ? 1 : 0);
+        if (entry.activeTexture !=
+            static_cast<int>(GL_TEXTURE0))
+            g_activeTexture(
+                static_cast<unsigned>(
+                    entry.activeTexture));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Replays g_deferredShadows[first, last) at the barrier-entry GL state that
+// RestoreFlushEntryState just reinstated. On return the caller must still
+// re-establish program, VAO, blend, depth mask, shade model, TMU0 env and
+// binding and the active texture: the shadow sets those itself. Everything
+// else it touches is put back here. matrixState is per flush: 0 unknown,
+// 1 live GL matrices equal the run matrices, 2 they must be loaded.
+void ReplayDeferredShadows(std::size_t first,
+                           std::size_t last,
+                           const FlushEntryState& entry,
+                           int& matrixState)
+{
+    if (first >= last || last > g_deferredShadows.size())
+        return;
+    const bool collect = prof::Active();
+
+    // Gold's TMU shadow is 0 after RestoreFlushEntryState's Gold bind. Make GL
+    // agree before anything is queried, the shadow binds through Gold.
+    bool saved = false;
+    ShadowEnv live{};
+    int blendSrc = static_cast<int>(GL_ONE);
+    int blendDst = 0;
+    float color[4]{1.0f, 1.0f, 1.0f, 1.0f};
+    float texCoord[4]{0.0f, 0.0f, 0.0f, 1.0f};
+    std::uint32_t triState[6]{};
+    __try
+    {
+        g_activeTexture(GL_TEXTURE0);
+        if (entry.program != 0)
+            g_useProgram(0);
+        g_getIntegerv(GL_BLEND_SRC, &blendSrc);
+        g_getIntegerv(GL_BLEND_DST, &blendDst);
+        g_getFloatv(GL_CURRENT_COLOR, color);
+        g_getFloatv(GL_CURRENT_TEXTURE_COORDS, texCoord);
+        triState[0] = *reinterpret_cast<const std::uint32_t*>(
+            g_hwBase + kTriRenderModeRva);
+        std::memcpy(&triState[1], g_hwBase + kTriColorRva,
+                    4u * sizeof(std::uint32_t));
+        triState[5] = *reinterpret_cast<const std::uint32_t*>(
+            g_hwBase + kVguiCurrentTextureRva);
+        saved = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        saved = false;
+    }
+    const bool envKnown = saved && CaptureShadowEnv(live);
+
+    if (matrixState == 0)
+    {
+        DirectMatrices liveMatrices{};
+        matrixState =
+            CaptureDirectMatrices(liveMatrices) &&
+            std::memcmp(&liveMatrices, &g_deferredRunMatrices,
+                        sizeof(liveMatrices)) == 0
+                ? 1
+                : 2;
+    }
+
+    bool matricesLoaded = false;
+    int previousMatrixMode = static_cast<int>(GL_MODELVIEW);
+    __try
+    {
+        if (matrixState == 2)
+        {
+            g_getIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+            g_matrixMode(GL_PROJECTION);
+            g_pushMatrix();
+            g_loadMatrixf(g_deferredRunMatrices.projection);
+            g_matrixMode(GL_TEXTURE);
+            g_pushMatrix();
+            g_loadMatrixf(g_deferredRunMatrices.texture);
+            g_matrixMode(GL_MODELVIEW);
+            g_pushMatrix();
+            g_loadMatrixf(g_deferredRunMatrices.modelView);
+            matricesLoaded = true;
+            if (collect)
+                ++g_flushProfile.shadowMatrixLoads;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        matricesLoaded = false;
+    }
+
+    ShadowEnv current = live;
+    for (std::size_t i = first; i < last; ++i)
+    {
+        const DeferredShadow& shadow = g_deferredShadows[i];
+        if (envKnown)
+        {
+            unsigned changes = 0;
+            __try
+            {
+                changes = TransitionShadowEnv(current, shadow.env);
+                current = shadow.env;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (collect)
+                g_flushProfile.shadowEnvFixes += changes;
+        }
+        const bool drawn = InvokeShadowProvider(
+            shadow.provider, shadow.sprite, shadow.points);
+        if (collect)
+        {
+            if (drawn)
+                ++g_flushProfile.shadowsReplayed;
+            else
+                ++g_flushProfile.shadowReplayFailures;
+        }
+    }
+
+    __try
+    {
+        if (envKnown)
+            (void)TransitionShadowEnv(current, live);
+        if (matricesLoaded)
+        {
+            g_matrixMode(GL_MODELVIEW);
+            g_popMatrix();
+            g_matrixMode(GL_TEXTURE);
+            g_popMatrix();
+            g_matrixMode(GL_PROJECTION);
+            g_popMatrix();
+            g_matrixMode(static_cast<unsigned>(previousMatrixMode));
+        }
+        if (saved)
+        {
+            // The shadow's GL_Bind left TMU0 active, matching Gold's shadow.
+            g_blendFunc(static_cast<unsigned>(blendSrc),
+                        static_cast<unsigned>(blendDst));
+            g_color4f(color[0], color[1], color[2], color[3]);
+            g_texCoord4fv(texCoord);
+            *reinterpret_cast<std::uint32_t*>(
+                g_hwBase + kTriRenderModeRva) = triState[0];
+            std::memcpy(g_hwBase + kTriColorRva, &triState[1],
+                        4u * sizeof(std::uint32_t));
+            *reinterpret_cast<std::uint32_t*>(
+                g_hwBase + kVguiCurrentTextureRva) = triState[5];
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 bool FlushDeferredSolidCommandsImpl()
 {
     if (g_deferredFlushInProgress)
@@ -6467,6 +6977,18 @@ bool FlushDeferredSolidCommandsImpl()
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         return false;
     }
+    FlushEntryState entry{};
+    entry.program = previousProgram;
+    entry.vao = previousVao;
+    entry.activeTexture = previousActiveTexture;
+    entry.texEnvMode = previousTexEnvMode;
+    entry.shadeModel = previousShadeModel;
+    entry.texture0 = previousTexture0;
+    entry.blend = previousBlend;
+    entry.depthWrite = previousDepthWrite;
+    // Deferred client shadows replayed so far, see ReplayDeferredShadows.
+    std::size_t nextShadow = 0;
+    int shadowMatrixState = 0;
 
     bool submitted = false;
     bool rangeBound = false;
@@ -6634,6 +7156,33 @@ bool FlushDeferredSolidCommandsImpl()
             const DeferredStudioCommand& command =
                 g_deferredCommands[g_deferredOrder[group.orderFirst]];
 
+            // Client shadows recorded before this group's packets reach GL
+            // here, in stock order. Groups never span a shadow and their
+            // segments never decrease (see BuildDeferredDrawPlan).
+            if (nextShadow < command.segment &&
+                nextShadow < g_deferredShadows.size())
+            {
+                const std::size_t shadowEnd =
+                    (std::min)(command.segment,
+                               g_deferredShadows.size());
+                RestoreFlushEntryState(entry);
+                ReplayDeferredShadows(
+                    nextShadow, shadowEnd, entry, shadowMatrixState);
+                nextShadow = shadowEnd;
+                g_activeTexture(GL_TEXTURE0);
+                g_useProgram(g_program);
+                g_shadeModel(GL_SMOOTH);
+                g_disable(GL_BLEND);
+                g_depthMask(1);
+                g_texEnvi(
+                    GL_TEXTURE_ENV,
+                    GL_TEXTURE_ENV_MODE,
+                    static_cast<int>(GL_MODULATE));
+                activeProgram = g_program;
+                boundVao = UINT_MAX;
+                boundTexture = UINT_MAX;
+            }
+
             if (group.count >= 2)
             {
                 const int instanceCount =
@@ -6740,7 +7289,7 @@ bool FlushDeferredSolidCommandsImpl()
                         const DeferredMeshDraw& itemDraw =
                             g_deferredMeshes[
                                 item.meshFirst + meshIndex];
-                        const bool flat = (itemDraw.flags & 1u) != 0u;
+                        const bool flat = itemDraw.constantLight;
                         instanceParams[member][0] =
                             flat ? -itemDraw.sScale : itemDraw.sScale;
                         instanceParams[member][1] = itemDraw.tScale;
@@ -6825,14 +7374,14 @@ bool FlushDeferredSolidCommandsImpl()
                     boundTexture = draw.glId;
                 }
                 const float params[4] = {
-                    (draw.flags & 1u) != 0u
+                    draw.constantLight
                         ? -draw.sScale
                         : draw.sScale,
                     draw.tScale,
-                    (draw.flags & 1u) != 0u
+                    draw.constantLight
                         ? draw.flatLight
                         : command.ambient,
-                    (draw.flags & 1u) != 0u
+                    draw.constantLight
                         ? 0.0f
                         : command.shade
                 };
@@ -6869,40 +7418,17 @@ bool FlushDeferredSolidCommandsImpl()
         submitted = false;
     }
 
-    __try
+    RestoreFlushEntryState(entry);
+    // Shadows recorded after the last packet, or not yet replayed because
+    // the submission faulted, are drawn at the restored barrier state and
+    // the state they leave behind is restored once more.
+    if (nextShadow < g_deferredShadows.size())
     {
-        g_bindBuffer(
-            GL_UNIFORM_BUFFER,
-            static_cast<unsigned>(
-                g_genericUniformRestore));
-        g_useProgram(
-            static_cast<unsigned>(
-                previousProgram));
-        g_bindVertexArray(
-            static_cast<unsigned>(
-                previousVao));
-        g_activeTexture(GL_TEXTURE0);
-        if (previousTexture0 > 0)
-            g_goldBind(0, previousTexture0);
-        else if (g_deferredEntryTextureValid)
-            g_goldBind(0, static_cast<int>(g_deferredEntryTexture));
-        g_texEnvi(
-            GL_TEXTURE_ENV,
-            GL_TEXTURE_ENV_MODE,
-            previousTexEnvMode);
-        g_shadeModel(
-            static_cast<unsigned>(previousShadeModel));
-        if (previousBlend)
-            g_enable(GL_BLEND);
-        if (!previousDepthWrite)
-            g_depthMask(0);
-        if (previousActiveTexture !=
-            static_cast<int>(GL_TEXTURE0))
-            g_activeTexture(
-                static_cast<unsigned>(
-                    previousActiveTexture));
+        ReplayDeferredShadows(
+            nextShadow, g_deferredShadows.size(), entry,
+            shadowMatrixState);
+        RestoreFlushEntryState(entry);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     if (rangeBound)
         NoteOwnedUniformRange(
@@ -6929,6 +7455,7 @@ bool FlushDeferredSolidCommandsImpl()
     }
 
     g_deferredCommands.clear();
+    g_deferredShadows.clear();
     g_deferredMeshes.clear();
     g_deferredBoneFloats.clear();
     g_deferredOrder.clear();
@@ -7032,17 +7559,26 @@ bool TryDirectDraw(void* wrapperCaller)
             return GlobalFallback(GlobalRejectReason::NotPlayer);
         ++g_nonPlayerAttempts;
         // Phase 1 owns only ordinary opaque StudioDrawModel calls in the solid
-        // entity pass.  Viewmodels/translucent entities are outside this scope,
-        // FOLLOW/aiment models retain Gold's bone-merge path.
-        if (g_solidEntityPassDepth <= 0 ||
-            g_nativeOpaqueDrawModelDepth <= 0 ||
-            !g_clientStudioShadowBarrierReady ||
-            !ReadExactRDrawEntitiesNormal() ||
-            !state.entityModel ||
-            state.moveType == 12 ||
-            state.aiment != 0 ||
-            state.renderFx != 0)
+        // entity pass. Viewmodels and translucent entities are drawn outside
+        // it. FOLLOW/aiment entities and renderfx other than the glow shell
+        // are admitted, see DrawModelEntryCompatible.
+        NonPlayerReject reject = NonPlayerReject::Count;
+        if (g_solidEntityPassDepth <= 0)
+            reject = NonPlayerReject::OutsidePass;
+        else if (g_nativeOpaqueDrawModelDepth <= 0)
+            reject = NonPlayerReject::DrawModelScope;
+        else if (state.renderFx == 19)
+            reject = NonPlayerReject::GlowShell;
+        else if (!g_clientStudioShadowBarrierReady ||
+                 !ReadExactRDrawEntitiesNormal() ||
+                 !state.entityModel)
+            reject = NonPlayerReject::Other;
+        if (reject != NonPlayerReject::Count)
+        {
+            if (prof::Active())
+                ++g_nonPlayerReject[static_cast<unsigned>(reject)];
             return GlobalFallback(GlobalRejectReason::NotPlayer);
+        }
     }
     if (state.renderMode != 0)
         return GlobalFallback(GlobalRejectReason::RenderMode);
@@ -7163,13 +7699,18 @@ bool TryDirectDraw(void* wrapperCaller)
             mesh.indexCount > static_cast<std::uint32_t>(INT_MAX) ||
             mesh.lastVertex >= cache->vertices.size())
             return DirectFallback(DirectFallbackReason::Material);
-        // Gold's R_StudioLighting has a non-player-only FULLBRIGHT shortcut
-        // that returns an exact scalar 1.0.  The current deferred shader does
-        // not encode that semantic yet, so fail open rather than darkening
-        // FULLBRIGHT props.
-        if (nonPlayerPhase1 && (material.flags & 4u) != 0u)
-            return DirectFallback(DirectFallbackReason::Material);
-        if ((material.flags & 1u) != 0u)
+        // Gold's R_StudioLighting (hw+0x96B50) returns before the FLATSHADE
+        // and normal paths when the mesh is FULLBRIGHT and the current entity
+        // is not a player: it stores exactly 1.0f and skips the lightgamma
+        // table lookup. DrawPoints then colors with colormix * 1.0, alpha
+        // r_blend, the same as the shader's constant-light path. The value
+        // is sampled from the stock function below, so it is that 1.0 bit
+        // for bit, not an assumption. Players never take the shortcut and
+        // keep their ordinary per-vertex lighting.
+        material.constantLight =
+            (material.flags & 1u) != 0u ||
+            (nonPlayerPhase1 && (material.flags & 4u) != 0u);
+        if (material.constantLight)
         {
             const unsigned flatVariant =
                 (material.flags & 4u) != 0u ? 1u : 0u;
@@ -7250,7 +7791,8 @@ bool TryDirectDraw(void* wrapperCaller)
     // will plan from, so the pending run must still fit after it.
     if (!g_deferredCommands.empty())
     {
-        if (!hasAdditive && DeferredCapacityAvailable() &&
+        if (!hasAdditive && PendingRunAdmitsForeignDraw() &&
+            DeferredCapacityAvailable() &&
             DepthOrderedOpaqueGlState())
             NoteBarrierSkip(FlushTrigger::Immediate);
         else
@@ -7319,11 +7861,13 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
             ++g_forcedProgramRestores;
     }
     // Fallback barrier: Gold's stock DrawPoints runs next. Opaque, depth-
-    // written stock output is order-independent of the pending run, anything
-    // blended or additive needs the run in the framebuffer first.
+    // written stock output is order-independent of the pending packets, but
+    // not of a pending (blended) client shadow. Anything blended or additive
+    // needs the run in the framebuffer first.
     if (!direct && !g_deferredCommands.empty())
     {
-        if (StockDrawPointsOrderIndependent())
+        if (PendingRunAdmitsForeignDraw() &&
+            StockDrawPointsOrderIndependent())
             NoteBarrierSkip(FlushTrigger::Fallback);
         else
             (void)FlushDeferredSolidCommands(
@@ -7378,6 +7922,20 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
                 "studio renderer: nonplayer phase1 attempts=%llu deferred=%llu",
                 static_cast<unsigned long long>(g_nonPlayerAttempts),
                 static_cast<unsigned long long>(g_nonPlayerDeferredDraws));
+            rendererlog::Line(
+                "studio renderer: nonplayer rejects outsidePass=%llu drawModelScope=%llu glow=%llu other=%llu; drawModel entry rejects flags=%llu mode=%llu caller=%llu drawentities=%llu entity=%llu rendermode=%llu glow=%llu force=%llu",
+                static_cast<unsigned long long>(g_nonPlayerReject[static_cast<unsigned>(NonPlayerReject::OutsidePass)]),
+                static_cast<unsigned long long>(g_nonPlayerReject[static_cast<unsigned>(NonPlayerReject::DrawModelScope)]),
+                static_cast<unsigned long long>(g_nonPlayerReject[static_cast<unsigned>(NonPlayerReject::GlowShell)]),
+                static_cast<unsigned long long>(g_nonPlayerReject[static_cast<unsigned>(NonPlayerReject::Other)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::Flags)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::Mode)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::Caller)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::DrawEntities)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::Entity)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::RenderMode)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::GlowShell)]),
+                static_cast<unsigned long long>(g_drawModelEntryReject[static_cast<unsigned>(DrawModelEntryReject::ForceFlags)]));
             rendererlog::Line(
                 "studio renderer: fallback reasons caller=%llu global=%llu neg=%llu cache=%llu submodel=%llu texture=%llu skin=%llu material=%llu matstate=%llu program=%llu stamp=%llu glstate=%llu execute=%llu",
                 static_cast<unsigned long long>(g_directFallbackReason[static_cast<unsigned>(DirectFallbackReason::Caller)]),
@@ -7500,13 +8058,15 @@ bool PatchRelativeCallTarget(std::uint8_t* callsite,
 
 // Brush, sprite and client shadow draws are the only non-Studio GL work Gold
 // interleaves with Studio draws inside the solid entity pass. They flush the
-// deferred run and end the current matrix / client-array snapshots.
+// deferred run (or skip it when order-independent, or defer the client shadow
+// into it) and end the current matrix / client-array snapshots.
 void __cdecl SolidBarrierFlush()
 {
     // Brush barrier. An opaque solid-pass brush entity is order-independent
     // of the pending run (BrushDrawOrderIndependent). Snapshots still end
     // here, the brush rewrites client arrays and the matrix stack.
-    if (!g_deferredCommands.empty() && BrushDrawOrderIndependent())
+    if (!g_deferredCommands.empty() && PendingRunAdmitsForeignDraw() &&
+        BrushDrawOrderIndependent())
         NoteBarrierSkip(FlushTrigger::Brush);
     else
         (void)FlushDeferredSolidCommands(
@@ -7514,14 +8074,158 @@ void __cdecl SolidBarrierFlush()
     InvalidatePassSnapshots();
 }
 
-void __cdecl ShadowBarrierFlush()
+void ShadowBarrierFlush()
 {
-    // Kept unconditional: the shadow is blended over what is already in the
-    // framebuffer, so pending packets must land first.
+    // The shadow is blended over what is already in the framebuffer, so
+    // without deferral the pending packets must land first.
     (void)FlushDeferredSolidCommands(
         FlushSite::InsideStudioDraw, FlushTrigger::Shadow);
     InvalidatePassSnapshots();
 }
+
+// Eye position of an orthonormal Gold view matrix, checked against the
+// near distance of its glFrustum projection. All four shadow corners placed
+// there make the original-time provider call rasterize nothing: the quad has
+// zero area and lies in front of the near plane (z_eye > -near is clipped by
+// any perspective frustum).
+bool ComputeShadowEyePoint(const DirectMatrices& matrices, float eye[3])
+{
+    const float* mv = matrices.modelView;
+    const float* p = matrices.projection;
+    if (p[3] != 0.0f || p[7] != 0.0f ||
+        p[11] != -1.0f || p[15] != 0.0f ||
+        mv[3] != 0.0f || mv[7] != 0.0f ||
+        mv[11] != 0.0f || mv[15] != 1.0f)
+        return false;
+    const float denominator = p[10] - 1.0f;
+    if (denominator == 0.0f)
+        return false;
+    const float nearPlane = p[14] / denominator;
+    if (!(nearPlane > 0.0f))
+        return false;
+    // Column-major: R[i][j] = mv[j * 4 + i], t[i] = mv[12 + i], eye = -R^T t.
+    for (int j = 0; j < 3; ++j)
+    {
+        eye[j] = -(mv[j * 4 + 0] * mv[12] +
+                   mv[j * 4 + 1] * mv[13] +
+                   mv[j * 4 + 2] * mv[14]);
+    }
+    // Verify instead of trusting orthonormality.
+    const float limit = nearPlane * 0.25f;
+    for (int i = 0; i < 3; ++i)
+    {
+        const float component =
+            mv[0 * 4 + i] * eye[0] +
+            mv[1 * 4 + i] * eye[1] +
+            mv[2 * 4 + i] * eye[2] +
+            mv[12 + i];
+        if (!(std::fabs(component) <= limit))
+            return false;
+    }
+    return true;
+}
+
+bool ReadClientShadowCall(const std::uintptr_t* args,
+                          DeferredShadow& shadow)
+{
+    if (!args || !g_clientStudioRenderShadowSlot || !g_hwBase ||
+        !g_getIntegerv)
+        return false;
+    __try
+    {
+        shadow.provider = reinterpret_cast<RenderShadowFn>(
+            *g_clientStudioRenderShadowSlot);
+        shadow.sprite = static_cast<int>(args[0]);
+        for (int corner = 0; corner < 4; ++corner)
+        {
+            const float* point =
+                reinterpret_cast<const float*>(args[1 + corner]);
+            if (!point)
+                return false;
+            std::memcpy(shadow.points[corner], point,
+                        sizeof(shadow.points[corner]));
+        }
+        // The shadow binds through Gold on TMU0. Gold's TMU shadow must be
+        // TMU0 here so replay reproduces the same unit selection.
+        if (*reinterpret_cast<const int*>(
+                g_hwBase + kGoldCurrentTmuRva) != 0)
+            return false;
+        int program = -1;
+        g_getIntegerv(GL_CURRENT_PROGRAM, &program);
+        return shadow.provider != nullptr && program == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// See the deferred client shadow notes above FlushDeferredSolidCommandsImpl.
+// Only used while a run is pending: with nothing recorded the stock call is
+// already in stock order.
+bool TryDeferClientShadow(const std::uintptr_t* args)
+{
+    if (ReadShadowDeferMode() != 1 ||
+        g_deferredCommands.empty() ||
+        g_deferredFlushInProgress ||
+        g_solidEntityPassDepth <= 0 ||
+        !g_deferredRunMatricesValid ||
+        !ShadowReplayFunctionsReady())
+        return false;
+
+    DeferredShadow shadow{};
+    if (!ReadClientShadowCall(args, shadow) ||
+        !CaptureShadowEnv(shadow.env))
+        return false;
+    // Replay draws under the run matrices, so they must be the live ones.
+    DirectMatrices live{};
+    float eye[3]{};
+    if (!CaptureDirectMatrices(live) ||
+        std::memcmp(&live, &g_deferredRunMatrices, sizeof(live)) != 0 ||
+        !ComputeShadowEyePoint(live, eye))
+        return false;
+
+    try
+    {
+        g_deferredShadows.push_back(shadow);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    const float degenerate[4][3] = {
+        {eye[0], eye[1], eye[2]},
+        {eye[0], eye[1], eye[2]},
+        {eye[0], eye[1], eye[2]},
+        {eye[0], eye[1], eye[2]}
+    };
+    if (!InvokeShadowProvider(
+            shadow.provider, shadow.sprite, degenerate))
+    {
+        g_deferredShadows.pop_back();
+        return false;
+    }
+    if (prof::Active())
+    {
+        ++g_flushProfile.shadowsDeferred;
+        ++g_flushProfile.siteSkips[
+            static_cast<unsigned>(FlushTrigger::Shadow)];
+    }
+    InvalidatePassSnapshots();
+    return true;
+}
+
+// Called from the client+AFE42 hook with a pointer to the provider's five
+// stack arguments. Returns true when the call has been fully handled.
+bool __cdecl ShadowBarrierDispatch(const std::uintptr_t* args)
+{
+    if (TryDeferClientShadow(args))
+        return true;
+    ShadowBarrierFlush();
+    return false;
+}
+
+unsigned char g_shadowCallHandled = 0;
 
 __declspec(naked) void DrawBrushModelBarrierCall()
 {
@@ -7549,7 +8253,8 @@ bool __cdecl TryBeginSolidSpriteCapture()
     InvalidatePassSnapshots();
     // Sprite barrier, skipped for alpha-tested opaque solid sprites
     // (SpriteDrawOrderIndependent).
-    if (!g_deferredCommands.empty() && SpriteDrawOrderIndependent())
+    if (!g_deferredCommands.empty() && PendingRunAdmitsForeignDraw() &&
+        SpriteDrawOrderIndependent())
         NoteBarrierSkip(FlushTrigger::Sprite);
     else if (!FlushDeferredSolidCommands(
                  FlushSite::OutsideStudioDraw, FlushTrigger::Sprite))
@@ -7593,8 +8298,11 @@ __declspec(naked) void ClientStudioShadowBarrierCall()
     __asm
     {
         // client+AFE42 is the exact FF15 StudioRenderShadow provider call.
-        // Flush only when Gold is actually about to emit the framebuffer
-        // shadow, then tail-dispatch through the live provider slot.
+        // Either the shadow is deferred into the pending run (the provider
+        // already ran, return to the client) or the run is flushed and the
+        // call tail-dispatches through the live provider slot. The cdecl
+        // caller pops the five arguments itself and reads neither flags nor
+        // a result after the call.
         sub esp, 80h
         movups [esp + 00h], xmm0
         movups [esp + 10h], xmm1
@@ -7606,7 +8314,12 @@ __declspec(naked) void ClientStudioShadowBarrierCall()
         movups [esp + 70h], xmm7
         pushfd
         pushad
-        call ShadowBarrierFlush
+        // 80h xmm save + 4 flags + 20h registers + 4 return address.
+        lea eax, [esp + 0A8h]
+        push eax
+        call ShadowBarrierDispatch
+        add esp, 4
+        mov byte ptr [g_shadowCallHandled], al
         popad
         popfd
         movups xmm0, [esp + 00h]
@@ -7618,10 +8331,14 @@ __declspec(naked) void ClientStudioShadowBarrierCall()
         movups xmm6, [esp + 60h]
         movups xmm7, [esp + 70h]
         add esp, 80h
+        cmp byte ptr [g_shadowCallHandled], 0
+        jne handled
         push eax
         mov eax, dword ptr [g_clientStudioRenderShadowSlot]
         mov eax, dword ptr [eax]
         xchg eax, dword ptr [esp]
+        ret
+    handled:
         ret
     }
 }
@@ -7856,6 +8573,14 @@ void LogFlushProfile()
         used += static_cast<std::size_t>(written);
     }
     rendererlog::Line(
+        "studio renderer: deferred shadows/frame=%.2f replayed=%llu "
+        "replayFail=%llu envFix=%llu matrixLoad=%llu",
+        static_cast<double>(stats.shadowsDeferred) / frames,
+        static_cast<unsigned long long>(stats.shadowsReplayed),
+        static_cast<unsigned long long>(stats.shadowReplayFailures),
+        static_cast<unsigned long long>(stats.shadowEnvFixes),
+        static_cast<unsigned long long>(stats.shadowMatrixLoads));
+    rendererlog::Line(
         "studio renderer: deferred flushes/frame=%.2f records/flush=%.2f "
         "maxRecords=%llu groups/flush=%.2f instGroups/frame=%.2f "
         "flushMs/frame=%.4f chargedMs/frame=%.4f matrixVerify=%llu "
@@ -7943,6 +8668,8 @@ bool Install(HMODULE client, HMODULE hw, cl_enginefunc_t* engine)
             engine->pfnRegisterVariable("r_meshoptimizer", "1", 0);
         g_instancingMode =
             engine->pfnRegisterVariable("r_studio_instancing", "0", 0);
+        g_shadowDeferMode =
+            engine->pfnRegisterVariable("r_studio_shadowdefer", "1", 0);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -7950,9 +8677,10 @@ bool Install(HMODULE client, HMODULE hw, cl_enginefunc_t* engine)
         g_nonPlayerMode = nullptr;
         g_meshoptMode = nullptr;
         g_instancingMode = nullptr;
+        g_shadowDeferMode = nullptr;
     }
     if (!g_mode || !g_nonPlayerMode ||
-        !g_meshoptMode || !g_instancingMode)
+        !g_meshoptMode || !g_instancingMode || !g_shadowDeferMode)
         return false;
 
     if (CurrentRelativeCallTarget(
@@ -7968,7 +8696,8 @@ bool Install(HMODULE client, HMODULE hw, cl_enginefunc_t* engine)
     rendererlog::Line(
         "studio renderer: whole-model retained cache ready "
         "(r_studio_renderer default 1, r_studio_nonplayer default 1, "
-        "r_meshoptimizer default 1, r_studio_instancing default 0)");
+        "r_meshoptimizer default 1, r_studio_instancing default 0, "
+        "r_studio_shadowdefer default 1)");
     return true;
 }
 
@@ -8069,9 +8798,13 @@ void FlushBeforeStockDrawModel(int flags, void* caller)
 {
     // A StudioDrawModel the recorder does not own. Opaque solid-pass studio
     // entities only reach the framebuffer through the hooked DrawPoints and
-    // the client shadow, both of which keep their own barriers.
+    // the client shadow, both of which keep their own barriers. Without
+    // STUDIO_RENDER (e.g. Gold's setup call for a FOLLOW entity's parent)
+    // the call only sets up bones, attachments and events, nothing pending
+    // is affected and nothing reaches the framebuffer.
     if (!g_deferredCommands.empty() &&
-        StockDrawModelOrderIndependent(flags, caller))
+        ((flags & 1) == 0 ||
+         StockDrawModelOrderIndependent(flags, caller)))
         NoteBarrierSkip(FlushTrigger::DrawModel);
     else
         (void)FlushDeferredSolidCommands(
