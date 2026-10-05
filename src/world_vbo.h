@@ -60,6 +60,12 @@ struct ProfileStats
     std::uint64_t batchRejectMultitexture;
     std::uint64_t batchRejectCache;
     std::uint64_t batchRejectClientState;
+    // Coverage of batched surfaces that used to fall back, and the number of
+    // lightmap groups (one TMU1 bind and at most one upload each).
+    std::uint64_t batchDecalSurfaces;
+    std::uint64_t batchRandomSurfaces;
+    std::uint64_t batchFlagSurfaces;
+    std::uint64_t batchLightmapGroups;
 };
 
 bool Install(HMODULE hw, cl_enginefunc_t* engine);
