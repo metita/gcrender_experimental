@@ -50,6 +50,7 @@ The table below lists every CVAR registered by GCRender. The status describes th
 | `r_profile` | `0` | **Diagnostic** | Enables frame/phase profiling and periodic reports. While enabled, log output is buffered in RAM and flushed to `gcrender.log` when profiling is disabled, avoiding filesystem I/O during the measured frames. |
 | `r_world_vbo` | `0` | **Experimental/off** | Retained BSP world VBO/EBO rendering. Off by default: the sequential path still issues one draw per surface, so it cannot beat immediate mode, and the paired A/B measured the world phase slower with it on. |
 | `r_world_brush_vbo` | `1` | **Default/on** | Uses the VBO path for brush-model world geometry, reducing repeated CPU-side vertex submission. |
+| `r_world_batch` | `0` | **Experimental/off** | Bucketed world renderer. Collects ordinary multitexture BSP surfaces during world traversal and draws them with one `glDrawElements` per texture and lightmap block from the static world VBO, uploading each dirty lightmap block once. Sky, water, scrolling, random-tiled, decal and detail surfaces, plus wireframe/fullbright passes, stay on the stock path. Mode `2` classifies surfaces without changing rendering. Builds the world VBO cache even when `r_world_vbo` is `0`. |
 | `r_particle_vbo` | `1` | **Default/on** | Streams particle geometry through a VBO instead of issuing the original immediate-mode vertex sequence. |
 | `r_beam_vbo` | `1` | **Default/on** | Batches supported beam geometry into a streaming VBO, reducing `glBegin`/per-vertex call overhead. |
 | `r_tracer_vbo` | `0` | **Experimental/off** | Enables the tracer VBO capture path. It remains disabled because a repeatable positive result has not been established. |
@@ -79,7 +80,7 @@ The table below lists every CVAR registered by GCRender. The status describes th
 | `r_studio_renderer` | `1` | **Default/on** | Enables the retained whole-model Studio renderer/cache path. The current screen shows a clear Studio phase reduction, while total frame impact remains scene dependent. |
 | `r_studio_nonplayer` | `0` | **Experimental/off** | Extends the retained Studio renderer path to non-player models. Current screening exercises the path, but it remains disabled pending broader compatibility validation. |
 | `r_meshoptimizer` | `1` | **Default/on** | Enables meshoptimizer-backed Studio mesh/index processing to improve geometry locality and submission efficiency. |
-| `r_studio_instancing` | `0` | **Experimental/off** | Enables experimental Studio instancing. The current benchmark workload recorded no instanced draws, so no performance conclusion is claimed. |
+| `r_studio_instancing` | `0` | **Experimental/off** | Groups deferred opaque Studio draws that share model, submodel, skin textures and material, then draws each mesh once per group with `glDrawElementsInstanced` (up to 32 entities, limited by the uniform block size). Per-entity bones, lighting and color are kept. Chrome, additive, masked, glow-shell and non-opaque models are never grouped. Coverage is reported by the `instDraw/instEnt/instSaved` and `instGroups/frame` counters; no performance result has been measured yet. |
 
 ## Benchmark and profiling evidence
 
