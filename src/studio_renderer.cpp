@@ -2866,6 +2866,23 @@ bool MaskedEntryStateReady()
     }
 }
 
+// Opaque retained draws (recorded or immediate) must start from Gold's
+// opaque state. If blending is on, stock would blend this draw, so the exact
+// answer is to let Gold draw it.
+bool OpaqueEntryBlendOff()
+{
+    if (!g_isEnabled)
+        return false;
+    __try
+    {
+        return g_isEnabled(GL_BLEND) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 bool AdditiveEntryStateReady()
 {
     if (!g_getIntegerv || !g_isEnabled || !g_depthMask ||
@@ -5749,7 +5766,11 @@ bool FlushDeferredSolidCommandsImpl()
         !g_getTexEnviv ||
         !g_shadeModel ||
         !g_goldBind ||
-        !g_drawElements)
+        !g_drawElements ||
+        !g_isEnabled ||
+        !g_enable ||
+        !g_disable ||
+        !g_depthMask)
         return false;
     if (!g_deferredRunMatricesValid)
         return false;
@@ -5791,6 +5812,12 @@ bool FlushDeferredSolidCommandsImpl()
         static_cast<int>(GL_REPLACE);
     int previousShadeModel =
         static_cast<int>(GL_FLAT);
+    // Recorded packets are opaque. A flush can run after Gold has already
+    // switched to a blended pass (e.g. the glow-shell ONE/ONE pass when the
+    // base-pass boundary flush could not submit), so the draws force opaque
+    // blend/depth-write state and restore the caller's state afterwards.
+    bool previousBlend = false;
+    int previousDepthWrite = 1;
     if (!ReadActiveTexture(previousActiveTexture))
         return false;
     __try
@@ -5809,6 +5836,10 @@ bool FlushDeferredSolidCommandsImpl()
         g_getIntegerv(
             GL_SHADE_MODEL,
             &previousShadeModel);
+        previousBlend = g_isEnabled(GL_BLEND) != 0;
+        g_getIntegerv(
+            GL_DEPTH_WRITEMASK,
+            &previousDepthWrite);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -5926,6 +5957,10 @@ bool FlushDeferredSolidCommandsImpl()
         if (!UploadDirectMatrices(g_deferredRunMatrices))
             __leave;
         g_shadeModel(GL_SMOOTH);
+        if (previousBlend)
+            g_disable(GL_BLEND);
+        if (!previousDepthWrite)
+            g_depthMask(1);
         g_texEnvi(
             GL_TEXTURE_ENV,
             GL_TEXTURE_ENV_MODE,
@@ -6203,6 +6238,10 @@ bool FlushDeferredSolidCommandsImpl()
             previousTexEnvMode);
         g_shadeModel(
             static_cast<unsigned>(previousShadeModel));
+        if (previousBlend)
+            g_enable(GL_BLEND);
+        if (!previousDepthWrite)
+            g_depthMask(0);
         if (previousActiveTexture !=
             static_cast<int>(GL_TEXTURE0))
             g_activeTexture(
@@ -6505,6 +6544,8 @@ bool TryDirectDraw(void* wrapperCaller)
     if (hasMasked && !MaskedEntryStateReady())
         return DirectFallback(DirectFallbackReason::MaterialState);
     if (hasAdditive && !AdditiveEntryStateReady())
+        return DirectFallback(DirectFallbackReason::MaterialState);
+    if (!hasAdditive && !OpaqueEntryBlendOff())
         return DirectFallback(DirectFallbackReason::MaterialState);
 
     if (!g_gammaFitKnown)
