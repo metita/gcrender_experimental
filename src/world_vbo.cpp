@@ -2630,7 +2630,7 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
         g_cvar = engine->pfnRegisterVariable("r_world_vbo", "0", 0);
         g_brushCvar =
             engine->pfnRegisterVariable("r_world_brush_vbo", "1", 0);
-        g_batchCvar = engine->pfnRegisterVariable("r_world_batch", "0", 0);
+        g_batchCvar = engine->pfnRegisterVariable("r_world_batch", "1", 0);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
