@@ -4289,6 +4289,7 @@ void __cdecl EndEmitterCapture()
 void LogStats()
 {
     if (g_drawPointsCalls != 1 && (g_drawPointsCalls & 0x7FFu) != 0) return;
+    if (!rendererlog::StatsEnabled()) return;
     rendererlog::Line("studiobatch: calls=%llu prim=%llu exact=%llu batched=%llu replay=%llu meshBatch=%llu meshReplay=%llu fallback=%llu verts=%llu captured=%llu preBuild=%llu preHit=%llu genHit=%llu genBump=%llu byteChk=%llu owner=%llu/%llu preFast=%llu preFallback=%llu preVal=%llu preMis=%llu preStd=%llu/%llu/%llu preAlt=%llu/%llu/%llu preChrome=%llu/%llu/%llu forced=%llu/%llu/%llu lambert=%llu skipped=%llu zeroLambert=%llu cornerIn=%llu cornerUnique=%llu ibo=%llu/%llu/%llu val=%llu/%llu range=%llu/%llu valR=%llu/%llu gpuStatic=%llu/%llu val=%llu/%llu fallback=%llu gpu=%llu/%llu/%llu",
                static_cast<unsigned long long>(g_drawPointsCalls),
                static_cast<unsigned long long>(g_primitives),
@@ -4359,6 +4360,8 @@ void LogPhaseStats()
 {
     if (!g_phaseMeshes || (g_drawPointsCalls & 0x7FFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     LARGE_INTEGER fq{};
     QueryPerformanceFrequency(&fq);
     if (!fq.QuadPart)
@@ -4382,6 +4385,8 @@ void LogAbStats()
 {
     const std::uint64_t total = g_abStockCalls + g_abBatchCalls;
     if (total == 0 || (total & 0x7FFu) != 0)
+        return;
+    if (!rendererlog::StatsEnabled())
         return;
     LARGE_INTEGER fq{};
     QueryPerformanceFrequency(&fq);

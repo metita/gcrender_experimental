@@ -463,7 +463,7 @@ void __cdecl PrepareGaitMask(void* self)
     g_activeGaitCount = count;
     g_gaitBonesFast += static_cast<std::uint64_t>(count);
 
-    if ((g_gaitSetups & 0xFFFu) == 0)
+    if ((g_gaitSetups & 0xFFFu) == 0 && rendererlog::StatsEnabled())
     {
         rendererlog::Line("fastgait: setups=%llu builds=%llu hits=%llu fallback=%llu validate=%llu mismatch=%llu bones=%llu",
                    static_cast<unsigned long long>(g_gaitSetups),
@@ -674,7 +674,7 @@ int __cdecl MergeLookup(void* self, const char* childName)
 
     ++g_mergeFast;
     g_mergeComparisonsSkipped += static_cast<std::uint64_t>(match >= 0 ? match : savedCount);
-    if ((g_mergeLookups & 0x3FFFu) == 0)
+    if ((g_mergeLookups & 0x3FFFu) == 0 && rendererlog::StatsEnabled())
         rendererlog::Line("fastmerge: lookups=%llu fast=%llu fallback=%llu builds=%llu hits=%llu validate=%llu mismatch=%llu skipped=%llu",
                    static_cast<unsigned long long>(g_mergeLookups),
                    static_cast<unsigned long long>(g_mergeFast),
@@ -952,7 +952,7 @@ void __cdecl SaveBonesDispatch(void* self)
     }
 
     InterlockedExchange(&g_busy, 0);
-    if ((g_calls & 0xFFFu) == 0)
+    if ((g_calls & 0xFFFu) == 0 && rendererlog::StatsEnabled())
     {
         LARGE_INTEGER fq{};
         QueryPerformanceFrequency(&fq);
@@ -1052,7 +1052,7 @@ bool Install(HMODULE client, cl_enginefunc_t* engine)
         return false;
     }
     g_engine = engine;
-    __try { g_mode = engine->pfnRegisterVariable("r_studio_savebones", "2", 0); }
+    __try { g_mode = engine->pfnRegisterVariable("r_studio_savebones", "1", 0); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_mode = nullptr; }
     __try { g_mergeMode = engine->pfnRegisterVariable("r_studio_mergebones", "1", 0); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_mergeMode = nullptr; }

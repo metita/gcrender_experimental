@@ -6331,7 +6331,7 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
         rendererlog::Line(
             "studio renderer: first direct retained DrawPoints completed");
     }
-    if ((g_directAttempts & 0xFFFu) == 0)
+    if ((g_directAttempts & 0xFFFu) == 0 && rendererlog::StatsEnabled())
     {
         rendererlog::Line(
             "studio renderer: direct attempts=%llu draws=%llu fallback=%llu coverage=%.1f%% deferred=%llu flushed=%llu pending=%u uboMap=%llu uboSub=%llu colorSkip=%llu paramsSkip=%llu instDraw=%llu instEnt=%llu instSaved=%llu progFix=%llu chrome=%llu chromeNormals=%llu",

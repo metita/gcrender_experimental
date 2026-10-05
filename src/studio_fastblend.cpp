@@ -261,7 +261,7 @@ int __cdecl Dispatch(void* renderer, float (*q1)[4], float (*pos1)[3],
         }
     }
 
-    if ((g_calls & 0x7FFu) == 0)
+    if ((g_calls & 0x7FFu) == 0 && rendererlog::StatsEnabled())
     {
         LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
         const double stockUs = (g_timed && fq.QuadPart)

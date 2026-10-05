@@ -235,6 +235,8 @@ void LogStats()
 {
     if ((g_calls & 0xFFFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     LARGE_INTEGER fq{};
     QueryPerformanceFrequency(&fq);
     const double stockUs = (g_timed && fq.QuadPart)

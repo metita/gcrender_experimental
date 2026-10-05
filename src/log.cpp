@@ -1,4 +1,5 @@
 #include "log.h"
+#include "profile.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdarg>
@@ -10,6 +11,8 @@ namespace
 {
 constexpr std::size_t kDeferredCapacity = 1024u * 1024u;
 constexpr std::size_t kLineCapacity = 4096u;
+// Past this size the log is rotated to gcrender.log.old before appending.
+constexpr ULONGLONG kMaxLogBytes = 8ull * 1024ull * 1024ull;
 
 SRWLOCK g_lock = SRWLOCK_INIT;
 bool g_deferred = false;
@@ -35,6 +38,15 @@ void WriteBlock(const char* data, std::size_t size, bool truncated)
 {
     char path[MAX_PATH];
     PathNextToUs(path, sizeof(path));
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &info) &&
+        ((static_cast<ULONGLONG>(info.nFileSizeHigh) << 32) | info.nFileSizeLow) > kMaxLogBytes)
+    {
+        char old[MAX_PATH];
+        _snprintf(old, sizeof(old), "%s.old", path);
+        old[sizeof(old) - 1] = 0;
+        MoveFileExA(path, old, MOVEFILE_REPLACE_EXISTING);
+    }
     FILE* f = fopen(path, "ab");
     if (!f)
         return;
@@ -76,6 +88,11 @@ void SetDeferred(bool deferred)
     g_deferredSize = 0;
     g_deferredTruncated = false;
     ReleaseSRWLockExclusive(&g_lock);
+}
+
+bool StatsEnabled()
+{
+    return prof::Active();
 }
 
 void Line(const char* fmt, ...)

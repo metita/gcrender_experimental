@@ -57,6 +57,8 @@ void LogStats()
 {
     if ((g_calls & 0x3FFFFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     rendererlog::Line("fasttexture: calls=%llu fast=%llu force=%llu simple=%llu name=%llu stock=%llu",
                static_cast<unsigned long long>(g_calls),
                static_cast<unsigned long long>(g_fast),
@@ -147,6 +149,8 @@ GlGetIntegervFn ReadGetIntegerv()
 void LogValidationStats()
 {
     if ((g_validate & 0xFFFu) != 0)
+        return;
+    if (!rendererlog::StatsEnabled())
         return;
     rendererlog::Line("fasttexture_validate: validate=%llu mismatch=%llu unavailable=%llu",
                static_cast<unsigned long long>(g_validate),

@@ -234,6 +234,8 @@ void LogStats()
 {
     if ((g_calls & 0x3FFFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     rendererlog::Line("fastchrome: calls=%llu stock=%llu fast=%llu first=%llu calib=%llu calibOk=%llu validate=%llu mismatch=%llu side=%llu fpFallback=%llu stale=%llu",
                static_cast<unsigned long long>(g_calls),
                static_cast<unsigned long long>(g_stock),

@@ -7,4 +7,7 @@ void Line(const char* fmt, ...);
 // While deferred, Line() only appends to an in-memory buffer. Disabling
 // deferred mode flushes the buffered block to gcrender.log in one file write.
 void SetDeferred(bool deferred);
+// Periodic counter dumps are diagnostic only: they are written while r_profile
+// is active and skipped otherwise, keeping file I/O out of normal frames.
+bool StatsEnabled();
 }

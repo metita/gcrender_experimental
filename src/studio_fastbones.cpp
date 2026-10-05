@@ -347,6 +347,8 @@ void LogPoseCacheStats()
 {
     if ((g_calls & 0xFFFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     rendererlog::Line("posecache: lookups=%llu candidates=%llu fpEligible=%llu hits=%llu outMis=%llu preEnvMis=%llu postEnvMis=%llu stores=%llu",
                static_cast<unsigned long long>(g_poseLookups),
                static_cast<unsigned long long>(g_poseCandidates),
@@ -546,7 +548,7 @@ int __cdecl Dispatch(void* renderer, void* pos, void* q, void* seqp, void* animp
         }
     }
 
-    if ((g_calls & 1023) == 0)
+    if ((g_calls & 1023) == 0 && rendererlog::StatsEnabled())
     {
         LARGE_INTEGER fq{};
         QueryPerformanceFrequency(&fq);

@@ -57,7 +57,7 @@ The table below lists every CVAR registered by GCRender. The status describes th
 | `r_studio_slerp` | `1` | **Default/on** | Uses the fast Studio animation blend/slerp path to reduce CPU work while interpolating animation data. |
 | `r_studio_bones` | `1` | **Default/on** | Uses the optimized Studio bone/rotation calculation path. |
 | `r_studio_posecache` | `1` | **Default/on** | Reuses compatible Studio pose results so repeated pose calculations can be avoided. Current measurements do not show a strong standalone gain. |
-| `r_studio_savebones` | `2` | **Default/on** | Optimizes Studio saved-bone handling. Mode `2` deliberately runs stock work plus validation and therefore has diagnostic overhead. Mode `1` is the performance mode. |
+| `r_studio_savebones` | `1` | **Default/on** | Optimizes Studio saved-bone handling. Mode `1` is the performance mode. Mode `2` runs stock work plus validation and is diagnostic only. |
 | `r_studio_mergebones` | `1` | **Default/on** | Enables the optimized bone-merge path used by Studio attachments/merged models. |
 | `r_studio_gait` | `1` | **Default/on** | Enables the optimized Studio gait-sequence calculation path. |
 | `r_studio_concat` | `1` | **Default/on** | Replaces repeated Studio transform concatenation work with the optimized implementation. |

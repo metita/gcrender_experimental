@@ -49,6 +49,8 @@ void LogStats()
 {
     if ((g_flatCalls & 0xFFFFFu) != 0)
         return;
+    if (!rendererlog::StatsEnabled())
+        return;
     rendererlog::Line("fastlighting: flatCalls=%llu stock=%llu hit=%llu miss=%llu validate=%llu mismatch=%llu",
                static_cast<unsigned long long>(g_flatCalls),
                static_cast<unsigned long long>(g_stock),
