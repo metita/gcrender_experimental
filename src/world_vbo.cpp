@@ -29,6 +29,11 @@ constexpr std::uintptr_t kNewMapRva            = 0x00073080u;
 constexpr std::uintptr_t kContextDestroyRva    = 0x000A26F0u;
 constexpr std::uintptr_t kGlBindRva            = 0x00064D40u;
 constexpr std::uintptr_t kSequentialResumeRva  = 0x00074103u;
+constexpr std::uintptr_t kRecursiveWorldNodeRva = 0x00075CC0u;
+constexpr std::uintptr_t kRecursiveWorldCallRva = 0x000760DDu; // R_DrawWorld top-level call
+constexpr std::uintptr_t kTextureAnimationRva   = 0x00073B20u;
+constexpr std::uintptr_t kRenderDynamicLightmapsRva = 0x00074640u;
+constexpr std::uintptr_t kBindWorldProgramRva   = 0x0007BE60u;
 
 constexpr std::uintptr_t kWorldModelRva        = 0x02F90E20u;
 constexpr std::uintptr_t kCurrentEntityRva     = 0x0078F470u;
@@ -39,6 +44,21 @@ constexpr std::uintptr_t kLightmapPolysRva     = 0x027DD878u;
 constexpr std::uintptr_t kTextureSortModeRva   = 0x0027268Cu;
 constexpr std::uintptr_t kLightmapOverrideRva  = 0x00790630u;
 constexpr std::uintptr_t kSequentialDebugDrawRva = 0x0333A3C8u;
+// R_DrawSequentialPoly multitexture-path globals (see r_world_batch below).
+constexpr std::uintptr_t kWorldSpecialPassRva   = 0x0078FA58u;
+constexpr std::uintptr_t kMultitextureUnitsRva  = 0x0333A980u;
+constexpr std::uintptr_t kMultitextureActiveRva = 0x0333A97Au; // byte
+constexpr std::uintptr_t kDetailEnabledRva      = 0x0043EB9Eu; // byte
+constexpr std::uintptr_t kDetailLoadedRva       = 0x0043EB9Fu; // byte
+constexpr std::uintptr_t kDetailCvarRva         = 0x02FDFDC0u;
+constexpr std::uintptr_t kWorldProgramRva       = 0x027E34A0u; // program table [3]
+constexpr std::uintptr_t kBoundProgramRva       = 0x03C4E4A4u;
+constexpr std::uintptr_t kLightmapRectRva       = 0x027DB078u;
+constexpr std::uintptr_t kLightmapModifiedRva   = 0x027DD078u;
+constexpr std::uintptr_t kLightmapTexturesRva   = 0x027DE078u;
+constexpr std::uintptr_t kLightmapBytesRva      = 0x027DE878u;
+constexpr std::uintptr_t kLightmapFormatRva     = 0x0027267Cu;
+constexpr std::uintptr_t kLightmapDataRva       = 0x00797A48u;
 
 constexpr std::uintptr_t kQglBeginRva               = 0x027E3DE0u;
 constexpr std::uintptr_t kQglEndRva                 = 0x027E3DD8u;
@@ -60,6 +80,8 @@ constexpr std::uintptr_t kQglGetIntegervRva         = 0x027E3DD0u;
 constexpr std::uintptr_t kQglIsEnabledRva           = 0x027E3DF4u;
 constexpr std::uintptr_t kQglClientActiveTextureRva = 0x027E386Cu;
 constexpr std::uintptr_t kQglTexSubImage2DRva       = 0x027E375Cu;
+constexpr std::uintptr_t kQglTexEnviRva             = 0x027E3744u;
+constexpr std::uintptr_t kQglUseProgramRva          = 0x027E381Cu;
 constexpr std::uintptr_t kSdlGetProcAddressIatRva   = 0x001FA330u;
 
 constexpr unsigned GL_POLYGON                 = 0x0009u;
@@ -84,6 +106,12 @@ constexpr unsigned GL_ELEMENT_ARRAY_BUFFER    = 0x8893u;
 constexpr unsigned GL_ARRAY_BUFFER_BINDING    = 0x8894u;
 constexpr unsigned GL_ELEMENT_ARRAY_BUFFER_BINDING = 0x8895u;
 constexpr unsigned GL_STATIC_DRAW             = 0x88E4u;
+constexpr unsigned GL_STREAM_DRAW             = 0x88E0u;
+constexpr unsigned GL_TEXTURE_2D              = 0x0DE1u;
+constexpr unsigned GL_UNSIGNED_BYTE           = 0x1401u;
+constexpr unsigned GL_TEXTURE_ENV             = 0x2300u;
+constexpr unsigned GL_TEXTURE_ENV_MODE        = 0x2200u;
+constexpr int GL_MODULATE                     = 0x2100;
 constexpr unsigned GL_CLIENT_VERTEX_ARRAY_BIT = 0x00000002u;
 constexpr unsigned GL_POLYGON_MODE            = 0x0B40u;
 constexpr unsigned GL_POLYGON_SMOOTH          = 0x0B41u;
@@ -94,6 +122,14 @@ constexpr int kSurfaceSize = 0x84;
 constexpr int kVertexStride = 7 * sizeof(float);
 constexpr int kMaxLightmaps = 64;
 constexpr unsigned kAllowedSurfaceFlags = 0x00000802u; // PLANEBACK + proven harmless 0x800
+// R_DrawWorld clears lightmap_polys with 0x800 bytes, and the rect/modified/
+// texture arrays are laid out back to back with the same stride: 512 blocks.
+constexpr int kMaxLightmapBlocks = 512;
+constexpr int kLightmapBlockSize = 128;
+constexpr int kBatchSlotBits = 11;
+constexpr int kBatchSlots = 1 << kBatchSlotBits;
+constexpr int kMaxBatchBuckets = 1024;
+constexpr std::size_t kBatchIboMinBytes = 256u * 1024u;
 
 using DrawTextureChainsFn = void (__cdecl*)();
 using RenderBrushPolyFn = void (__fastcall*)(std::uint8_t* surface, void* ignored);
@@ -135,7 +171,15 @@ using GlTexSubImage2DFn = void (WINAPI*)(unsigned target, int level,
                                         int width, int height,
                                         unsigned format, unsigned type,
                                         const void* pixels);
+using GlBufferSubDataFn = void (WINAPI*)(unsigned target, std::ptrdiff_t offset,
+                                         std::ptrdiff_t size, const void* data);
+using GlTexEnviFn = void (WINAPI*)(unsigned target, unsigned pname, int param);
+using GlUseProgramFn = void (WINAPI*)(unsigned program);
 using SdlGetProcAddressFn = void* (__cdecl*)(const char* name);
+using RecursiveWorldNodeFn = void (__fastcall*)(std::uint8_t* node, int flag);
+using TextureAnimationFn = std::uint8_t* (__fastcall*)(std::uint8_t* surface);
+using RenderDynamicLightmapsFn = void (__fastcall*)(std::uint8_t* surface);
+using BindWorldProgramFn = void (__fastcall*)(unsigned program);
 
 struct SurfaceInfo
 {
@@ -146,6 +190,23 @@ struct SurfaceInfo
     std::uint8_t* poly = nullptr;
     std::uint32_t batchedGeneration = 0;
     std::uint32_t legacyGeneration = 0;
+    std::uint32_t worldBatchFrame = 0;
+};
+
+struct BatchBucket
+{
+    int texnum;
+    int lightmap;
+    int head;
+    int tail;
+    int indexCount;
+    int firstElement;
+};
+
+struct BatchEntry
+{
+    int surface;
+    int next;
 };
 
 std::uint8_t* g_hwBase = nullptr;
@@ -235,6 +296,34 @@ int g_worldPreviousArrayBuffer = 0;
 int g_worldPreviousClientTexture = static_cast<int>(GL_TEXTURE0);
 int g_brushPreviousArrayBuffer = 0;
 int g_brushPreviousClientTexture = static_cast<int>(GL_TEXTURE0);
+int g_maxTextureUnits = 0;
+std::uint32_t g_maxTextureUnitsGeneration = 0;
+
+// r_world_batch state. Collection is live only inside the top-level
+// R_RecursiveWorldNode call of R_DrawWorld.
+cvar_t* g_batchCvar = nullptr;
+int g_batchMode = 0;
+bool g_batchCallsiteReady = false;
+bool g_batchCollecting = false;
+bool g_batchValidating = false;
+bool g_batchFlushing = false;
+bool g_batchFrameRejected = false;
+int g_batchCallerFlag = 0;
+int g_batchLastSurface = -1;
+std::uint32_t g_batchFrame = 0;
+RecursiveWorldNodeFn g_recursiveWorldNode = nullptr;
+TextureAnimationFn g_textureAnimation = nullptr;
+RenderDynamicLightmapsFn g_renderDynamicLightmaps = nullptr;
+BindWorldProgramFn g_bindWorldProgram = nullptr;
+GlBufferSubDataFn g_bufferSubData = nullptr;
+std::vector<BatchBucket> g_batchBuckets;
+std::vector<BatchEntry> g_batchEntries;
+std::vector<std::uint8_t> g_batchStaging;
+std::uint32_t g_batchSlotStamp[kBatchSlots]{};
+int g_batchSlotBucket[kBatchSlots]{};
+unsigned g_batchIbo = 0;
+std::size_t g_batchIboCapacity = 0;
+std::size_t g_batchIboOffset = 0;
 
 template <typename T>
 T Read(std::uint8_t* base, std::size_t offset)
@@ -287,15 +376,21 @@ void ForgetGpuBuffer(bool deleteIfPossible)
 {
     if (deleteIfPossible && g_deleteBuffers && !g_contextLost)
     {
-        unsigned ids[2]{};
+        unsigned ids[3]{};
         int count = 0;
         if (g_vbo) ids[count++] = g_vbo;
         if (g_ibo) ids[count++] = g_ibo;
+        if (g_batchIbo) ids[count++] = g_batchIbo;
         if (count)
             g_deleteBuffers(count, ids);
     }
     g_vbo = 0;
     g_ibo = 0;
+    g_batchIbo = 0;
+    g_batchIboCapacity = 0;
+    g_batchIboOffset = 0;
+    g_batchBuckets.clear();
+    g_batchEntries.clear();
     g_world = nullptr;
     g_surfaces = nullptr;
     g_numSurfaces = 0;
@@ -334,9 +429,11 @@ bool RefreshGlFunctions()
     g_multiDrawArrays = nullptr;
     g_drawElements = nullptr;
     g_multiDrawElements = nullptr;
+    g_bufferSubData = nullptr;
     auto getProc = *reinterpret_cast<SdlGetProcAddressFn*>(g_hwBase + kSdlGetProcAddressIatRva);
     if (getProc)
     {
+        g_bufferSubData = reinterpret_cast<GlBufferSubDataFn>(getProc("glBufferSubData"));
         g_multiDrawArrays = reinterpret_cast<GlMultiDrawArraysFn>(getProc("glMultiDrawArrays"));
         if (!g_multiDrawArrays)
             g_multiDrawArrays = reinterpret_cast<GlMultiDrawArraysFn>(getProc("glMultiDrawArraysEXT"));
@@ -364,6 +461,21 @@ std::size_t WorldIndexBytes()
     return g_index16 ? sizeof(std::uint16_t) : sizeof(std::uint32_t);
 }
 
+// GL_MAX_TEXTURE_UNITS is immutable for a context. Query it once per context
+// generation instead of once per detail surface/scope.
+int CachedMaxTextureUnits()
+{
+    if (g_maxTextureUnitsGeneration != g_contextGeneration ||
+        g_maxTextureUnits <= 0)
+    {
+        int units = 0;
+        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &units);
+        g_maxTextureUnits = units;
+        g_maxTextureUnitsGeneration = g_contextGeneration;
+    }
+    return g_maxTextureUnits;
+}
+
 bool ForeignClientArraysClear(int ownedTexcoordUnits)
 {
     if (!g_isEnabled || !g_getIntegerv || !g_clientActiveTexture)
@@ -384,10 +496,9 @@ bool ForeignClientArraysClear(int ownedTexcoordUnits)
             g_isEnabled(GL_SECONDARY_COLOR_ARRAY))
             return false;
 
-        int maxTextureUnits = 0;
         g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
         clientTextureKnown = true;
-        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
+        const int maxTextureUnits = CachedMaxTextureUnits();
         if (maxTextureUnits < 1 || maxTextureUnits > 32)
             return false;
 
@@ -699,24 +810,48 @@ void __cdecl BeforeSequentialCall(std::uint8_t* surface, int /*face*/,
     g_expectedSequentialLightmap = lightmap;
 }
 
+bool CollectWorldBatchSurface(std::uint8_t* surface, int callerFlag);
+
+// Returns nonzero when r_world_batch consumed the surface: the stock call is
+// skipped and the caller's own `add esp, 4` releases the stack argument.
+int __cdecl SequentialCallDispatch(std::uint8_t* surface, int face, int callerFlag)
+{
+    if (g_batchCollecting || g_batchValidating)
+    {
+        if (CollectWorldBatchSurface(surface, callerFlag))
+            return 1;
+    }
+    else if (g_batchFrameRejected && g_collectStats)
+    {
+        ++g_stats.batchFallbackFrame;
+    }
+    BeforeSequentialCall(surface, face, callerFlag);
+    return 0;
+}
+
 void __declspec(naked) SequentialCall_Hook()
 {
     __asm
     {
         // Exact hw.dll ABI: ECX=msurface_t*, EDX=face, plus one caller-owned
-        // stack argument. Preserve the original stack verbatim and tail-jump
-        // so the callee still observes that third argument at [ebp+8].
-        pushfd
-        pushad
-        mov eax, dword ptr [esp + 40]
-        push eax
+        // stack argument that the caller pops. R_DrawSequentialPoly is an
+        // ordinary callee (EBX/ESI/EDI/EBP preserved, EAX/ECX/EDX/flags
+        // clobbered, no return value) and both callers reload everything they
+        // use afterwards, so only ECX/EDX must survive for the tail-jump.
+        push ecx
+        push edx
+        push dword ptr [esp + 12]
         push edx
         push ecx
-        call BeforeSequentialCall
+        call SequentialCallDispatch
         add esp, 12
-        popad
-        popfd
+        pop edx
+        pop ecx
+        test eax, eax
+        jne consumed
         jmp dword ptr [g_drawSequentialPoly]
+    consumed:
+        ret
     }
 }
 
@@ -930,6 +1065,474 @@ bool EnsureCache()
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// r_world_batch: bucketed sequential (gl_texsort 0) world renderer.
+//
+// Builds on the static world VBO/EBO cache above, which is built on demand
+// even when r_world_vbo is 0. The top-level R_RecursiveWorldNode call in
+// R_DrawWorld is wrapped. While it runs, the R_DrawSequentialPoly callsite
+// consumes ordinary surfaces of the exact multitexture path:
+//
+//   R_RenderDynamicLightmaps(s)            -> called here, same point/order
+//   t = R_TextureAnimation(s)              -> called here (pure after init)
+//   GL_Bind(0, t), TexEnvi MODULATE        -> replayed per bucket
+//   GL_Bind(1, lightmap_textures[lm])      -> replayed per bucket
+//   upload lightmap_rectchange[lm] if dirty -> replayed per lightmap, merged
+//   detail helper / program[3] / Begin..End -> no-detail only, one draw
+//
+// When recursion returns, and before R_DrawWorld disables multitexture and
+// unbinds the world program, the collected surfaces are drawn as one
+// glDrawElements per (animated texture, lightmap block) bucket from a
+// streaming index buffer. Every other surface keeps stock R_DrawSequentialPoly
+// at its traversal point, so stock surfaces now draw before batched ones. The
+// world is opaque and depth tested, decals are clipped to (and drawn right
+// after) their own stock surface, and lightmap texels of distinct surfaces are
+// disjoint, so the only observable difference is the order of exactly
+// coplanar overlapping world faces.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+T& HwGlobal(std::uintptr_t rva)
+{
+    return *reinterpret_cast<T*>(g_hwBase + rva);
+}
+
+bool EnsureBatchStorage()
+{
+    try
+    {
+        const std::size_t surfaces = static_cast<std::size_t>(g_numSurfaces);
+        if (g_batchEntries.capacity() < surfaces)
+            g_batchEntries.reserve(surfaces);
+        if (g_batchBuckets.capacity() < static_cast<std::size_t>(kMaxBatchBuckets))
+            g_batchBuckets.reserve(static_cast<std::size_t>(kMaxBatchBuckets));
+        // Every surface is collected at most once per pass, so the whole-map
+        // index count bounds the per-pass staging size.
+        const std::size_t bytes = g_indexData.size() * WorldIndexBytes();
+        if (g_batchStaging.size() < bytes)
+            g_batchStaging.resize(bytes);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    return true;
+}
+
+bool RejectWorldBatch(std::uint64_t ProfileStats::*counter)
+{
+    g_batchFrameRejected = true;
+    if (g_collectStats)
+        ++(g_stats.*counter);
+    return false;
+}
+
+bool BeginWorldBatch()
+{
+    g_batchCollecting = false;
+    g_batchValidating = false;
+    g_batchFrameRejected = false;
+    g_batchLastSurface = -1;
+    g_batchCallerFlag = 0;
+    g_batchBuckets.clear();
+    g_batchEntries.clear();
+
+    if (!g_installed || g_batchMode == 0 || !rendererperf::Enabled() ||
+        !g_batchCallsiteReady || !g_sequentialCallsitesReady)
+        return false;
+
+    // Whole-pass gates: these select a different R_DrawSequentialPoly branch
+    // or add per-surface work after qglEnd for every surface.
+    auto* entity = HwGlobal<std::uint8_t*>(kCurrentEntityRva);
+    if (HwGlobal<int>(kTextureSortModeRva) != 0 || !entity ||
+        Read<int>(entity, 0x2F8) != 0 ||
+        HwGlobal<int>(kWorldSpecialPassRva) != 0)
+        return RejectWorldBatch(&ProfileStats::batchRejectState);
+    if (HwGlobal<int>(kSequentialDebugDrawRva) != 0)
+        return RejectWorldBatch(&ProfileStats::batchRejectWireframe);
+    if (HwGlobal<int>(kLightmapOverrideRva) != 0)
+        return RejectWorldBatch(&ProfileStats::batchRejectLightmap);
+    if (HwGlobal<int>(kMultitextureUnitsRva) < 2 ||
+        HwGlobal<std::uint8_t>(kMultitextureActiveRva) == 0 ||
+        !ReadQgl<GlMTexCoord2fFn>(kQglMTexCoord2fRva))
+        return RejectWorldBatch(&ProfileStats::batchRejectMultitexture);
+    if (!EnsureCache() || !g_drawElements || !g_glBind ||
+        !ReadQgl<GlTexEnviFn>(kQglTexEnviRva) ||
+        !ReadQgl<GlTexSubImage2DFn>(kQglTexSubImage2DRva) ||
+        !EnsureBatchStorage())
+        return RejectWorldBatch(&ProfileStats::batchRejectCache);
+    // Client arrays are never touched by hw.dll during the world pass, so the
+    // pre-pass check covers the deferred draw at the end of recursion.
+    if (!PolygonFillMode() || !ForeignClientArraysClear(2))
+        return RejectWorldBatch(&ProfileStats::batchRejectClientState);
+
+    if (++g_batchFrame == 0)
+    {
+        for (SurfaceInfo& info : g_surfaceInfo)
+            info.worldBatchFrame = 0;
+        std::memset(g_batchSlotStamp, 0, sizeof(g_batchSlotStamp));
+        g_batchFrame = 1;
+    }
+
+    if (g_batchMode == 2)
+        g_batchValidating = true;
+    else
+        g_batchCollecting = true;
+    if (g_collectStats)
+        ++g_stats.batchFrames;
+    return true;
+}
+
+bool BatchFallback(std::uint64_t ProfileStats::*counter)
+{
+    g_batchLastSurface = -1;
+    if (g_collectStats)
+        ++(g_stats.*counter);
+    return false;
+}
+
+int FindOrAddBatchBucket(int texnum, int lightmap)
+{
+    std::uint32_t hash = static_cast<std::uint32_t>(texnum) * 0x9E3779B1u ^
+                         static_cast<std::uint32_t>(lightmap) * 0x85EBCA6Bu;
+    hash >>= 32 - kBatchSlotBits;
+    for (int probe = 0; probe < kBatchSlots; ++probe)
+    {
+        const std::uint32_t slot = (hash + static_cast<std::uint32_t>(probe)) &
+                                   static_cast<std::uint32_t>(kBatchSlots - 1);
+        if (g_batchSlotStamp[slot] != g_batchFrame)
+        {
+            if (g_batchBuckets.size() >= static_cast<std::size_t>(kMaxBatchBuckets))
+                return -1;
+            g_batchSlotStamp[slot] = g_batchFrame;
+            g_batchSlotBucket[slot] = static_cast<int>(g_batchBuckets.size());
+            g_batchBuckets.push_back(BatchBucket{texnum, lightmap, -1, -1, 0, 0});
+            return g_batchSlotBucket[slot];
+        }
+        const BatchBucket& bucket =
+            g_batchBuckets[static_cast<std::size_t>(g_batchSlotBucket[slot])];
+        if (bucket.texnum == texnum && bucket.lightmap == lightmap)
+            return g_batchSlotBucket[slot];
+    }
+    return -1;
+}
+
+bool CollectWorldBatchSurface(std::uint8_t* surface, int callerFlag)
+{
+    const int index = SurfaceIndex(surface);
+    if (index < 0)
+        return BatchFallback(&ProfileStats::batchFallbackUncached);
+
+    // SURF_DRAWSKY/DRAWTURB/UNDERWATER take R_DrawSequentialPoly's early
+    // branch, 0x200 is the scrolling texcoord loop, everything else outside
+    // the proven ordinary set (tiled/no-lightmap, ...) stays stock as well.
+    const unsigned flags = Read<unsigned>(surface, 0x08);
+    if ((flags & ~kAllowedSurfaceFlags) != 0)
+    {
+        if ((flags & 0x94u) != 0)
+            return BatchFallback(&ProfileStats::batchFallbackSpecial);
+        if ((flags & 0x200u) != 0)
+            return BatchFallback(&ProfileStats::batchFallbackScroll);
+        return BatchFallback(&ProfileStats::batchFallbackFlags);
+    }
+
+    SurfaceInfo& info = g_surfaceInfo[static_cast<std::size_t>(index)];
+    if (info.first < 0 || info.count < 3 || !info.poly ||
+        info.indexFirst < 0 || info.indexCount < 3 ||
+        info.worldBatchFrame == g_batchFrame ||
+        Read<std::uint8_t*>(surface, 0x24) != info.poly ||
+        Read<std::uint8_t*>(info.poly, 0x00) != nullptr ||
+        Read<int>(info.poly, 0x08) != info.count)
+        return BatchFallback(&ProfileStats::batchFallbackUncached);
+
+    // Decals are queued and drawn right after qglEnd by stock.
+    if (Read<std::uint8_t*>(surface, 0x58) != nullptr)
+        return BatchFallback(&ProfileStats::batchFallbackDecal);
+
+    const int lightmap = Read<int>(surface, 0x38);
+    if (lightmap < 0 || lightmap >= kMaxLightmapBlocks)
+        return BatchFallback(&ProfileStats::batchFallbackLightmap);
+
+    auto* texinfo = Read<std::uint8_t*>(surface, 0x2C);
+    if (!texinfo || Read<int>(texinfo, 0x28) != 0)
+        return BatchFallback(&ProfileStats::batchFallbackSpecial);
+    auto* base = Read<std::uint8_t*>(texinfo, 0x24);
+    if (!base)
+        return BatchFallback(&ProfileStats::batchFallbackSpecial);
+    if (base[0] == '-')
+        return BatchFallback(&ProfileStats::batchFallbackRandom);
+
+    // R_TextureAnimation only reads cl.time/currententity->frame after its
+    // one-time random table init, so calling it here (and again from stock on
+    // fallback) is observably identical to the single stock call.
+    auto* texture = g_textureAnimation(surface);
+    if (!texture)
+        return BatchFallback(&ProfileStats::batchFallbackSpecial);
+
+    // Mirror the detail helper's gate: before its one-time load, or when the
+    // animated texture owns a detail texture, it changes TMU2 state.
+    if (HwGlobal<std::uint8_t>(kDetailEnabledRva) != 0 &&
+        HwGlobal<int>(kDetailCvarRva) != 0 &&
+        (HwGlobal<std::uint8_t>(kDetailLoadedRva) == 0 ||
+         Read<std::uintptr_t>(texture, 0x50) != 0))
+        return BatchFallback(&ProfileStats::batchFallbackDetail);
+
+    if (g_batchValidating)
+    {
+        // r_world_batch 2: classification only, stock still draws everything.
+        g_batchLastSurface = -1;
+        if (g_collectStats)
+            ++g_stats.batchValidateSurfaces;
+        return false;
+    }
+
+    if (g_batchEntries.size() >= g_batchEntries.capacity())
+        return BatchFallback(&ProfileStats::batchFallbackOverflow);
+    const int texnum = Read<int>(texture, 0x1C);
+    const int bucketIndex = FindOrAddBatchBucket(texnum, lightmap);
+    if (bucketIndex < 0)
+        return BatchFallback(&ProfileStats::batchFallbackOverflow);
+
+    // Exact stock CPU work for this surface: c_brush_polys, lightmap_polys
+    // chain, and the dynamic lightmap rebuild that marks the block modified.
+    // The matching upload is deferred to the flush of this pass.
+    g_renderDynamicLightmaps(surface);
+
+    BatchBucket& bucket = g_batchBuckets[static_cast<std::size_t>(bucketIndex)];
+    const int entry = static_cast<int>(g_batchEntries.size());
+    g_batchEntries.push_back(BatchEntry{index, -1});
+    if (bucket.tail >= 0)
+        g_batchEntries[static_cast<std::size_t>(bucket.tail)].next = entry;
+    else
+        bucket.head = entry;
+    bucket.tail = entry;
+    bucket.indexCount += info.indexCount;
+    info.worldBatchFrame = g_batchFrame;
+    g_batchLastSurface = index;
+    g_batchCallerFlag = callerFlag;
+    if (g_collectStats)
+        ++g_stats.batchSurfaces;
+    return true;
+}
+
+// Same upload as R_DrawSequentialPoly: full-width rows of the accumulated
+// dirty rect, then reset the rect. Called with the block bound on TMU1.
+void UploadBatchLightmap(int lightmap)
+{
+    int* modified = &HwGlobal<int>(kLightmapModifiedRva);
+    if (modified[lightmap] == 0)
+        return;
+    modified[lightmap] = 0;
+    int* rect = &HwGlobal<int>(kLightmapRectRva + static_cast<std::uintptr_t>(lightmap) * 16u);
+    const int top = rect[1];
+    const int height = rect[3];
+    const int bytes = HwGlobal<int>(kLightmapBytesRva);
+    const int offset = ((lightmap << 7) + top) * bytes << 7;
+    auto texSubImage = ReadQgl<GlTexSubImage2DFn>(kQglTexSubImage2DRva);
+    texSubImage(GL_TEXTURE_2D, 0, 0, top, kLightmapBlockSize, height,
+                static_cast<unsigned>(HwGlobal<int>(kLightmapFormatRva)),
+                GL_UNSIGNED_BYTE, g_hwBase + kLightmapDataRva + offset);
+    rect[0] = kLightmapBlockSize;
+    rect[1] = kLightmapBlockSize;
+    rect[3] = 0;
+    rect[2] = 0;
+    if (g_collectStats)
+        ++g_stats.batchLightmapUploads;
+}
+
+// Streams this pass's indices into a ring element buffer, orphaning on wrap.
+// Returns the byte offset to use as the glDrawElements base, or a client
+// pointer (with no element buffer bound) if no buffer object is available.
+std::uintptr_t UploadBatchIndices(std::size_t bytes)
+{
+    if (!g_batchIbo)
+    {
+        unsigned id = 0;
+        g_genBuffers(1, &id);
+        g_batchIbo = id;
+        g_batchIboCapacity = 0;
+        g_batchIboOffset = 0;
+    }
+    if (!g_batchIbo)
+    {
+        g_bindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        return reinterpret_cast<std::uintptr_t>(g_batchStaging.data());
+    }
+
+    g_bindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_batchIbo);
+    if (!g_bufferSubData)
+    {
+        g_bufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(bytes),
+                     g_batchStaging.data(), GL_STREAM_DRAW);
+        if (g_collectStats)
+            ++g_stats.batchIndexOrphans;
+        return 0;
+    }
+
+    if (bytes > g_batchIboCapacity)
+    {
+        std::size_t capacity = g_batchIboCapacity ? g_batchIboCapacity : kBatchIboMinBytes;
+        while (capacity < bytes * 4u)
+            capacity *= 2u;
+        g_bufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(capacity),
+                     nullptr, GL_STREAM_DRAW);
+        g_batchIboCapacity = capacity;
+        g_batchIboOffset = 0;
+        if (g_collectStats)
+            ++g_stats.batchIndexOrphans;
+    }
+    else if (g_batchIboOffset + bytes > g_batchIboCapacity)
+    {
+        g_bufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<std::ptrdiff_t>(g_batchIboCapacity),
+                     nullptr, GL_STREAM_DRAW);
+        g_batchIboOffset = 0;
+        if (g_collectStats)
+            ++g_stats.batchIndexOrphans;
+    }
+    const std::size_t offset = g_batchIboOffset;
+    g_bufferSubData(GL_ELEMENT_ARRAY_BUFFER, static_cast<std::ptrdiff_t>(offset),
+                    static_cast<std::ptrdiff_t>(bytes), g_batchStaging.data());
+    g_batchIboOffset = (offset + bytes + 15u) & ~static_cast<std::size_t>(15u);
+    return offset;
+}
+
+void FlushWorldBatch()
+{
+    if (g_batchBuckets.empty())
+        return;
+
+    // Build per-bucket contiguous index ranges from the static fan indices.
+    const std::size_t indexBytes = WorldIndexBytes();
+    const std::uint8_t* source = g_index16
+        ? reinterpret_cast<const std::uint8_t*>(g_indexData16.data())
+        : reinterpret_cast<const std::uint8_t*>(g_indexData.data());
+    const std::size_t capacity = g_batchStaging.size() / indexBytes;
+    std::uint8_t* staging = g_batchStaging.data();
+    std::size_t cursor = 0;
+    for (BatchBucket& bucket : g_batchBuckets)
+    {
+        bucket.firstElement = static_cast<int>(cursor);
+        for (int e = bucket.head; e >= 0;
+             e = g_batchEntries[static_cast<std::size_t>(e)].next)
+        {
+            const SurfaceInfo& info = g_surfaceInfo[static_cast<std::size_t>(
+                g_batchEntries[static_cast<std::size_t>(e)].surface)];
+            const std::size_t count = static_cast<std::size_t>(info.indexCount);
+            if (cursor + count > capacity)
+                break; // unreachable: each surface is collected once per pass
+            std::memcpy(staging + cursor * indexBytes,
+                        source + static_cast<std::size_t>(info.indexFirst) * indexBytes,
+                        count * indexBytes);
+            cursor += count;
+        }
+        bucket.indexCount = static_cast<int>(cursor) - bucket.firstElement;
+    }
+
+    int previousArrayBuffer = 0;
+    int previousIndexBuffer = 0;
+    int previousClientTexture = static_cast<int>(GL_TEXTURE0);
+    g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &previousArrayBuffer);
+    g_getIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &previousIndexBuffer);
+    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
+
+    g_pushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
+    g_bindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    g_enableClientState(GL_VERTEX_ARRAY);
+    g_vertexPointer(3, GL_FLOAT, kVertexStride, reinterpret_cast<const void*>(0));
+    g_clientActiveTexture(GL_TEXTURE0);
+    g_enableClientState(GL_TEXTURE_COORD_ARRAY);
+    g_texCoordPointer(2, GL_FLOAT, kVertexStride,
+                      reinterpret_cast<const void*>(3 * sizeof(float)));
+    g_clientActiveTexture(GL_TEXTURE0 + 1u);
+    g_enableClientState(GL_TEXTURE_COORD_ARRAY);
+    g_texCoordPointer(2, GL_FLOAT, kVertexStride,
+                      reinterpret_cast<const void*>(5 * sizeof(float)));
+    g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previousArrayBuffer));
+
+    const std::uintptr_t indexBase = UploadBatchIndices(cursor * indexBytes);
+
+    // Material sequence of the stock multitexture branch. GL_Bind keeps hw's
+    // per-unit bind/enable caches coherent and the qgl slots keep gl_state's
+    // filters coherent, so code after the pass observes consistent state.
+    g_batchFlushing = true;
+    auto texEnvi = ReadQgl<GlTexEnviFn>(kQglTexEnviRva);
+    const int* lightmapTextures = &HwGlobal<int>(kLightmapTexturesRva);
+    const unsigned indexType = WorldIndexType();
+    bool first = true;
+    for (const BatchBucket& bucket : g_batchBuckets)
+    {
+        if (bucket.indexCount <= 0)
+            continue;
+        g_glBind(0, bucket.texnum);
+        if (first)
+        {
+            // TMU0 env is not touched between buckets, set it once.
+            texEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+            g_bindWorldProgram(HwGlobal<unsigned>(kWorldProgramRva));
+            first = false;
+        }
+        g_glBind(1, lightmapTextures[bucket.lightmap]);
+        UploadBatchLightmap(bucket.lightmap);
+        const std::uintptr_t start =
+            indexBase + static_cast<std::uintptr_t>(bucket.firstElement) * indexBytes;
+        g_drawElements(GL_TRIANGLES, bucket.indexCount, indexType,
+                       reinterpret_cast<const void*>(start));
+        if (g_collectStats)
+            ++g_stats.batchDraws;
+    }
+    g_batchFlushing = false;
+
+    g_popClientAttrib();
+    g_bindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<unsigned>(previousIndexBuffer));
+    g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previousArrayBuffer));
+    g_clientActiveTexture(static_cast<unsigned>(previousClientTexture));
+
+    // Immediate mode leaves the last emitted texcoords current. Reproduce them
+    // when the final traversal surface was batched, plus the post-qglEnd
+    // program unbind R_DrawSequentialPoly performs for a nonzero caller flag.
+    if (g_batchLastSurface >= 0)
+    {
+        const SurfaceInfo& last = g_surfaceInfo[static_cast<std::size_t>(g_batchLastSurface)];
+        const float* v = reinterpret_cast<const float*>(last.poly + 0x10) +
+                         (last.count - 1) * 7;
+        auto mtexCoord = ReadQgl<GlMTexCoord2fFn>(kQglMTexCoord2fRva);
+        mtexCoord(GL_TEXTURE0, v[3], v[4]);
+        mtexCoord(GL_TEXTURE0 + 1u, v[5], v[6]);
+    }
+    if (g_batchCallerFlag != 0 && HwGlobal<int>(kBoundProgramRva) != 0)
+    {
+        HwGlobal<int>(kBoundProgramRva) = 0;
+        if (auto useProgram = ReadQgl<GlUseProgramFn>(kQglUseProgramRva))
+            useProgram(0);
+    }
+
+    if (g_collectStats)
+    {
+        ++g_stats.batchFlushes;
+        g_stats.batchIndices += static_cast<std::uint64_t>(cursor);
+    }
+}
+
+void EndWorldBatch()
+{
+    if (g_batchCollecting)
+        FlushWorldBatch();
+    g_batchCollecting = false;
+    g_batchValidating = false;
+    g_batchFrameRejected = false;
+    g_batchBuckets.clear();
+    g_batchEntries.clear();
+}
+
+void __fastcall RecursiveWorldNode_Hook(std::uint8_t* node, int flag)
+{
+    const bool batching = BeginWorldBatch();
+    g_recursiveWorldNode(node, flag);
+    if (batching || g_batchFrameRejected)
+        EndWorldBatch();
+}
+
 bool __cdecl DrawPreparedSequential();
 
 bool DetailClientArrayProvidersReady()
@@ -971,47 +1574,50 @@ bool DrawPreparedDetailSequential()
     if (!DetailClientArrayProvidersReady())
         return false;
 
-    int maxTextureUnits = 0;
+    // Per-scope work is hoisted into Begin{World,Brush}Scope, which already
+    // ran ForeignClientArraysClear(2), saved the client-active texture and
+    // ARRAY_BUFFER binding, and pushed GL_CLIENT_VERTEX_ARRAY_BIT. hw.dll never
+    // calls qglClientActiveTexture/qglBindBuffer (their qgl slots are only
+    // referenced by the loader table), so those saved values are still the
+    // live ones here, and the scope pop restores the borrowed TMU2 pointer.
     int previousClientTexture = static_cast<int>(GL_TEXTURE0);
     int previousArrayBuffer = 0;
-    bool clientTextureKnown = false;
-    bool arrayBufferKnown = false;
-    bool pushed = false;
+    if (g_brushScopeReady)
+    {
+        previousClientTexture = g_brushPreviousClientTexture;
+        previousArrayBuffer = g_brushPreviousArrayBuffer;
+    }
+    else if (g_worldScopeReady)
+    {
+        previousClientTexture = g_worldPreviousClientTexture;
+        previousArrayBuffer = g_worldPreviousArrayBuffer;
+    }
+    else
+    {
+        return false;
+    }
 
+    bool borrowed = false;
     __try
     {
-        g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
+        const int maxTextureUnits = CachedMaxTextureUnits();
         if (maxTextureUnits < 3 || maxTextureUnits > 32)
             return false;
-
-        // TMU2 is borrowed only for this exact draw. Any foreign enabled array
-        // on TMU2 or above would participate in DrawArrays, unlike Gold's
-        // immediate loop, so fail open before changing client state.
-        if (!ForeignClientArraysClear(2))
-            return false;
-
-        g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &previousClientTexture);
-        clientTextureKnown = true;
         if (previousClientTexture < static_cast<int>(GL_TEXTURE0) ||
             previousClientTexture >= static_cast<int>(GL_TEXTURE0) + maxTextureUnits)
             return false;
-        g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &previousArrayBuffer);
-        arrayBufferKnown = true;
-
-        g_pushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
-        pushed = true;
 
         // glTexCoordPointer captures the VBO binding. The server active texture
         // is never touched here, Gold's detail helper has already left it in the
         // exact state expected by the code after qglEnd.
         g_bindBuffer(GL_ARRAY_BUFFER, g_vbo);
         g_clientActiveTexture(GL_TEXTURE0 + 2u);
+        borrowed = true;
         if (g_isEnabled(GL_TEXTURE_COORD_ARRAY))
         {
             g_clientActiveTexture(static_cast<unsigned>(previousClientTexture));
             g_bindBuffer(GL_ARRAY_BUFFER,
                          static_cast<unsigned>(previousArrayBuffer));
-            g_popClientAttrib();
             return false;
         }
         g_enableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -1025,36 +1631,25 @@ bool DrawPreparedDetailSequential()
 
         g_drawArrays(GL_TRIANGLE_FAN, g_sequentialFirst, g_sequentialCount);
 
-        // Disable the borrowed array before restoring the exact client snapshot.
+        // Disable the borrowed array so ordinary surfaces never consume it.
         g_clientActiveTexture(GL_TEXTURE0 + 2u);
         g_disableClientState(GL_TEXTURE_COORD_ARRAY);
-        g_clientActiveTexture(static_cast<unsigned>(previousClientTexture));
-        g_popClientAttrib();
-        pushed = false;
-        g_bindBuffer(GL_ARRAY_BUFFER, static_cast<unsigned>(previousArrayBuffer));
         g_clientActiveTexture(static_cast<unsigned>(previousClientTexture));
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        if (pushed)
-        {
-            __try
-            {
-                g_popClientAttrib();
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-        }
         __try
         {
-            if (arrayBufferKnown)
-                g_bindBuffer(GL_ARRAY_BUFFER,
-                             static_cast<unsigned>(previousArrayBuffer));
-            if (clientTextureKnown)
-                g_clientActiveTexture(
-                    static_cast<unsigned>(previousClientTexture));
+            if (borrowed)
+            {
+                g_clientActiveTexture(GL_TEXTURE0 + 2u);
+                g_disableClientState(GL_TEXTURE_COORD_ARRAY);
+            }
+            g_bindBuffer(GL_ARRAY_BUFFER,
+                         static_cast<unsigned>(previousArrayBuffer));
+            g_clientActiveTexture(
+                static_cast<unsigned>(previousClientTexture));
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1384,6 +1979,8 @@ void WINAPI TexSubImage2D_Hook(unsigned target, int level,
 {
     if (g_worldScopeReady)
         FlushSequentialRun(true);
+    if (g_collectStats && g_batchCollecting && !g_batchFlushing)
+        ++g_stats.batchStockLightmapUploads;
     if (g_texSubImage2D)
         g_texSubImage2D(target, level, xoffset, yoffset, width, height,
                         format, type, pixels);
@@ -1739,6 +2336,9 @@ bool __fastcall ContextDestroy_Hook(void* self, void* ignored)
     g_contextLost = true;
     g_vbo = 0; // context deletion owns the old GPU object, never delete it later
     g_ibo = 0;
+    g_batchIbo = 0;
+    g_batchIboCapacity = 0;
+    g_batchIboOffset = 0;
     g_dirty = true;
     return g_contextDestroy ? g_contextDestroy(self, ignored) : true;
 }
@@ -1799,17 +2399,27 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
     g_drawSequentialPoly = g_hwBase + kDrawSequentialPolyRva;
     g_renderBrushPoly = reinterpret_cast<RenderBrushPolyFn>(g_hwBase + kRenderBrushPolyRva);
     g_glBind = reinterpret_cast<GlBindFn>(g_hwBase + kGlBindRva);
+    g_recursiveWorldNode =
+        reinterpret_cast<RecursiveWorldNodeFn>(g_hwBase + kRecursiveWorldNodeRva);
+    g_textureAnimation =
+        reinterpret_cast<TextureAnimationFn>(g_hwBase + kTextureAnimationRva);
+    g_renderDynamicLightmaps =
+        reinterpret_cast<RenderDynamicLightmapsFn>(g_hwBase + kRenderDynamicLightmapsRva);
+    g_bindWorldProgram =
+        reinterpret_cast<BindWorldProgramFn>(g_hwBase + kBindWorldProgramRva);
 
     __try
     {
         g_cvar = engine->pfnRegisterVariable("r_world_vbo", "0", 0);
         g_brushCvar =
             engine->pfnRegisterVariable("r_world_brush_vbo", "1", 0);
+        g_batchCvar = engine->pfnRegisterVariable("r_world_batch", "0", 0);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         g_cvar = nullptr;
         g_brushCvar = nullptr;
+        g_batchCvar = nullptr;
     }
 
     if (!RefreshGlFunctions())
@@ -1862,6 +2472,18 @@ bool Install(HMODULE hw, cl_enginefunc_t* engine)
         return false;
     }
 
+    // r_world_batch flushes right after the top-level world recursion, before
+    // R_DrawWorld disables multitexture. Without this callsite it stays off.
+    g_batchCallsiteReady =
+        g_sequentialCallsitesReady &&
+        PatchCall(g_hwBase + kRecursiveWorldCallRva,
+                  reinterpret_cast<void*>(g_recursiveWorldNode),
+                  reinterpret_cast<void*>(&RecursiveWorldNode_Hook));
+    rendererlog::Line("worldbatch: %s (recursion callsite=%s, buffer_subdata=%s)",
+                      g_batchCallsiteReady ? "available" : "unavailable",
+                      g_batchCallsiteReady ? "yes" : "no",
+                      g_bufferSubData ? "yes" : "no");
+
     g_installed = true;
     g_dirty = true;
     rendererlog::Line("worldvbo: installed retained BSP VBO/EBO + immediate sequential VBO safety path (r_world_vbo=1 r_world_brush_vbo=1 defaults, multidraw=%s, multidraw_elements=%s, seq_calls=%s, lm_barrier=%s)",
@@ -1894,6 +2516,21 @@ void UpdateFrame()
     }
     g_mode = mode;
     g_enabled = mode == 1;
+    int batchMode = 0;
+    if (g_batchCvar)
+    {
+        __try
+        {
+            const float value = g_batchCvar->value;
+            if (value == 1.0f) batchMode = 1;
+            else if (value == 2.0f) batchMode = 2;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            batchMode = 0;
+        }
+    }
+    g_batchMode = batchMode;
     g_brushEnabled = false;
     if (g_brushCvar)
     {
@@ -2067,6 +2704,48 @@ ProfileStats ConsumeProfileStats()
 {
     ProfileStats out = g_stats;
     g_stats = {};
+    // Called once per profile report. The shared report line predates these
+    // counters, so emit them here, only while periodic stats are enabled.
+    if (rendererlog::StatsEnabled() &&
+        (out.batchFrames || out.batchFallbackFrame ||
+         out.batchRejectState || out.batchRejectWireframe ||
+         out.batchRejectLightmap || out.batchRejectMultitexture ||
+         out.batchRejectCache || out.batchRejectClientState))
+    {
+        rendererlog::Line("PROFILE worldbatch: mode=%d frames=%llu flushes=%llu surfaces=%llu "
+                   "draws=%llu indices=%llu orphans=%llu lm_merged=%llu lm_stock=%llu "
+                   "validate=%llu fb_uncached=%llu fb_special=%llu fb_scroll=%llu "
+                   "fb_flags=%llu fb_decal=%llu fb_detail=%llu fb_random=%llu "
+                   "fb_lightmap=%llu fb_overflow=%llu fb_frame=%llu rej_state=%llu "
+                   "rej_wire=%llu rej_lmoverride=%llu rej_mtex=%llu rej_cache=%llu "
+                   "rej_client=%llu",
+                   g_batchMode,
+                   static_cast<unsigned long long>(out.batchFrames),
+                   static_cast<unsigned long long>(out.batchFlushes),
+                   static_cast<unsigned long long>(out.batchSurfaces),
+                   static_cast<unsigned long long>(out.batchDraws),
+                   static_cast<unsigned long long>(out.batchIndices),
+                   static_cast<unsigned long long>(out.batchIndexOrphans),
+                   static_cast<unsigned long long>(out.batchLightmapUploads),
+                   static_cast<unsigned long long>(out.batchStockLightmapUploads),
+                   static_cast<unsigned long long>(out.batchValidateSurfaces),
+                   static_cast<unsigned long long>(out.batchFallbackUncached),
+                   static_cast<unsigned long long>(out.batchFallbackSpecial),
+                   static_cast<unsigned long long>(out.batchFallbackScroll),
+                   static_cast<unsigned long long>(out.batchFallbackFlags),
+                   static_cast<unsigned long long>(out.batchFallbackDecal),
+                   static_cast<unsigned long long>(out.batchFallbackDetail),
+                   static_cast<unsigned long long>(out.batchFallbackRandom),
+                   static_cast<unsigned long long>(out.batchFallbackLightmap),
+                   static_cast<unsigned long long>(out.batchFallbackOverflow),
+                   static_cast<unsigned long long>(out.batchFallbackFrame),
+                   static_cast<unsigned long long>(out.batchRejectState),
+                   static_cast<unsigned long long>(out.batchRejectWireframe),
+                   static_cast<unsigned long long>(out.batchRejectLightmap),
+                   static_cast<unsigned long long>(out.batchRejectMultitexture),
+                   static_cast<unsigned long long>(out.batchRejectCache),
+                   static_cast<unsigned long long>(out.batchRejectClientState));
+    }
     return out;
 }
 } // namespace worldvbo

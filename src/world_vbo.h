@@ -33,6 +33,33 @@ struct ProfileStats
     std::uint64_t detailVertices;
     long long drawTextureChainsTicks;
     std::uint64_t drawTextureChainsCalls;
+    // r_world_batch. Fallback counters are surfaces left on stock
+    // R_DrawSequentialPoly, frame rejects are world passes kept fully stock.
+    std::uint64_t batchFrames;
+    std::uint64_t batchFlushes;
+    std::uint64_t batchSurfaces;
+    std::uint64_t batchDraws;
+    std::uint64_t batchIndices;
+    std::uint64_t batchIndexOrphans;
+    std::uint64_t batchLightmapUploads;
+    std::uint64_t batchStockLightmapUploads;
+    std::uint64_t batchValidateSurfaces;
+    std::uint64_t batchFallbackUncached;
+    std::uint64_t batchFallbackSpecial;
+    std::uint64_t batchFallbackScroll;
+    std::uint64_t batchFallbackFlags;
+    std::uint64_t batchFallbackDecal;
+    std::uint64_t batchFallbackDetail;
+    std::uint64_t batchFallbackRandom;
+    std::uint64_t batchFallbackLightmap;
+    std::uint64_t batchFallbackOverflow;
+    std::uint64_t batchFallbackFrame;
+    std::uint64_t batchRejectState;
+    std::uint64_t batchRejectWireframe;
+    std::uint64_t batchRejectLightmap;
+    std::uint64_t batchRejectMultitexture;
+    std::uint64_t batchRejectCache;
+    std::uint64_t batchRejectClientState;
 };
 
 bool Install(HMODULE hw, cl_enginefunc_t* engine);
