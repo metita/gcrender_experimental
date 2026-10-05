@@ -20,7 +20,7 @@ int __cdecl DrawPlayer(int flags, entity_state_t* player)
 {
     if (!g_orig) return 0;
     if (flags != 3)
-        studio_renderer::FlushSolidEntityCommands();
+        studio_renderer::FlushBeforeDrawPlayer(flags);
     const bool profiling = prof::Active();
     const long long t0 = profiling ? prof::Now() : 0;
     int result = g_orig(flags, player);
@@ -37,7 +37,7 @@ int __cdecl DrawModel(int flags)
         studio_renderer::BeginDrawModelBatchScope(
             flags, _ReturnAddress());
     if (!batchScope)
-        studio_renderer::FlushSolidEntityCommands();
+        studio_renderer::FlushBeforeStockDrawModel(flags, _ReturnAddress());
     const int result = g_origModel(flags);
     studio_renderer::EndDrawModelBatchScope(batchScope);
     return result;

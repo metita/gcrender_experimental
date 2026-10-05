@@ -86,6 +86,9 @@ constexpr std::uintptr_t kQglGenBuffersRva = 0x027E3DCCu;
 constexpr std::uintptr_t kQglBufferDataRva = 0x027E3DB4u;
 constexpr std::uintptr_t kQglGetIntegervRva = 0x027E3DD0u;
 constexpr std::uintptr_t kGoldCurrentTmuRva = 0x027E35E0u;
+// Solid R_DrawSpriteModel inputs, same addresses as sprite_vbo's capture gate.
+constexpr std::uintptr_t kSpriteTextureMatrixRva = 0x0078F944u;
+constexpr std::uintptr_t kSpriteBlendRva = 0x0333A008u;
 
 constexpr unsigned GL_ARRAY_BUFFER = 0x8892u;
 constexpr unsigned GL_ELEMENT_ARRAY_BUFFER = 0x8893u;
@@ -154,6 +157,16 @@ constexpr unsigned GL_MAP_INVALIDATE_RANGE_BIT = 0x0004u;
 constexpr unsigned GL_MAP_UNSYNCHRONIZED_BIT = 0x0020u;
 constexpr unsigned GL_MAP_INVALIDATE_BUFFER_BIT = 0x0008u;
 constexpr unsigned GL_MAP_FLUSH_EXPLICIT_BIT = 0x0010u;
+constexpr unsigned GL_MAP_PERSISTENT_BIT = 0x0040u;
+constexpr unsigned GL_MAP_COHERENT_BIT = 0x0080u;
+constexpr unsigned GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117u;
+constexpr unsigned GL_SYNC_FLUSH_COMMANDS_BIT = 0x0001u;
+constexpr unsigned GL_ALREADY_SIGNALED = 0x911Au;
+constexpr unsigned GL_CONDITION_SATISFIED = 0x911Cu;
+constexpr unsigned GL_MAJOR_VERSION = 0x821Bu;
+constexpr unsigned GL_MINOR_VERSION = 0x821Cu;
+constexpr unsigned GL_EXTENSIONS = 0x1F03u;
+constexpr unsigned GL_DEPTH_TEST = 0x0B71u;
 constexpr unsigned GL_INVALID_INDEX = 0xFFFFFFFFu;
 constexpr unsigned char GL_FALSE_VALUE = 0;
 
@@ -251,6 +264,13 @@ using GlFlushMappedBufferRangeFn = void (WINAPI*)(unsigned target,
                                                   std::ptrdiff_t offset,
                                                   std::ptrdiff_t length);
 using GlUnmapBufferFn = unsigned char (WINAPI*)(unsigned target);
+using GlBufferStorageFn = void (WINAPI*)(unsigned target, std::ptrdiff_t size,
+                                        const void* data, unsigned flags);
+using GlFenceSyncFn = void* (WINAPI*)(unsigned condition, unsigned flags);
+using GlClientWaitSyncFn = unsigned (WINAPI*)(void* sync, unsigned flags,
+                                             unsigned long long timeout);
+using GlDeleteSyncFn = void (WINAPI*)(void* sync);
+using GlGetStringFn = const unsigned char* (WINAPI*)(unsigned name);
 using GlGenVertexArraysFn = void (WINAPI*)(int count, unsigned* arrays);
 using GlDeleteVertexArraysFn = void (WINAPI*)(int count, const unsigned* arrays);
 using GlBindVertexArrayFn = void (WINAPI*)(unsigned array);
@@ -512,6 +532,11 @@ GlBindBufferBaseFn g_bindBufferBase = nullptr;
 GlMapBufferRangeFn g_mapBufferRange = nullptr;
 GlFlushMappedBufferRangeFn g_flushMappedBufferRange = nullptr;
 GlUnmapBufferFn g_unmapBuffer = nullptr;
+GlBufferStorageFn g_bufferStorage = nullptr;
+GlFenceSyncFn g_fenceSync = nullptr;
+GlClientWaitSyncFn g_clientWaitSync = nullptr;
+GlDeleteSyncFn g_deleteSync = nullptr;
+GlGetStringFn g_getString = nullptr;
 GlGenVertexArraysFn g_genVertexArrays = nullptr;
 GlDeleteVertexArraysFn g_deleteVertexArrays = nullptr;
 GlBindVertexArrayFn g_bindVertexArray = nullptr;
@@ -601,14 +626,28 @@ constexpr std::size_t kBoneRecordFloats = kBoneRecordBytes / sizeof(float);
 constexpr std::size_t kMaxInstancedBlockBytes = 64u * 1024u;
 constexpr unsigned kInstanceCap = 32;
 
+// Every frame region is addressed as (buffer, base + offset) with offsets in
+// [0, kUniformBufferBytes). Orphan mode owns one buffer per frame (base 0),
+// persistent mode carves the three regions out of one mapped buffer.
 struct UniformBufferFrame
 {
     unsigned buffer = 0;
+    std::size_t base = 0;
+    // Persistent mode: GPU fence for the last frame that wrote this region.
+    void* fence = nullptr;
 };
 
 UniformBufferFrame g_uniformBuffers[kUniformBufferCount]{};
 int g_uniformBufferFrame = 0;
 std::size_t g_uniformBufferOffset = 0;
+// GL_ARB_buffer_storage ring: one immutable buffer of
+// kUniformBufferCount * kUniformBufferBytes, mapped write/persistent/coherent
+// for the lifetime of the GL context. Bone blocks are written straight into
+// the current frame region, a fence per region guards its reuse three frames
+// later. Null when the orphan + map/subdata path is active.
+std::uint8_t* g_uniformPersistentBase = nullptr;
+std::uint64_t g_uniformPersistentWrites = 0;
+std::uint64_t g_uniformFenceWaits = 0;
 int g_uniformBufferAlignment = 256;
 int g_uniformBlockMaxSize = 0;
 std::uint32_t g_uniformBufferGeneration = 0;
@@ -1087,6 +1126,21 @@ bool RefreshShaderFunctions()
     g_unmapBuffer =
         reinterpret_cast<GlUnmapBufferFn>(
             GetGlProc("glUnmapBuffer"));
+    g_bufferStorage =
+        reinterpret_cast<GlBufferStorageFn>(
+            GetGlProc("glBufferStorage"));
+    g_fenceSync =
+        reinterpret_cast<GlFenceSyncFn>(GetGlProc("glFenceSync"));
+    g_clientWaitSync =
+        reinterpret_cast<GlClientWaitSyncFn>(
+            GetGlProc("glClientWaitSync"));
+    g_deleteSync =
+        reinterpret_cast<GlDeleteSyncFn>(GetGlProc("glDeleteSync"));
+    if (HMODULE gl = GetModuleHandleA("opengl32.dll"))
+    {
+        g_getString = reinterpret_cast<GlGetStringFn>(
+            GetProcAddress(gl, "glGetString"));
+    }
     g_genVertexArrays =
         reinterpret_cast<GlGenVertexArraysFn>(GetGlProc("glGenVertexArrays"));
     g_deleteVertexArrays =
@@ -1506,8 +1560,11 @@ void ResetProgramForContext(std::uint32_t generation)
     g_useUniformBuffer = false;
     g_boneBlockIndex = GL_INVALID_INDEX;
     g_boneBlockBinding = 0;
+    // The previous context owned the buffers, mapping and fences, so they
+    // are dropped rather than deleted through the new context.
     for (UniformBufferFrame& frame : g_uniformBuffers)
-        frame.buffer = 0;
+        frame = {};
+    g_uniformPersistentBase = nullptr;
     g_uniformBufferFrame = 0;
     g_uniformBufferOffset = 0;
     g_uniformBufferAlignment = 256;
@@ -1665,6 +1722,176 @@ bool UniformBufferApiReady()
            g_getIntegerv;
 }
 
+bool HasExtensionToken(const char* extensions, const char* name)
+{
+    if (!extensions || !name || !*name)
+        return false;
+    const std::size_t length = std::strlen(name);
+    for (const char* at = std::strstr(extensions, name); at;
+         at = std::strstr(at + 1, name))
+    {
+        const bool startOk = at == extensions || at[-1] == ' ';
+        const char end = at[length];
+        if (startOk && (end == '\0' || end == ' '))
+            return true;
+    }
+    return false;
+}
+
+// GL 4.4 core or GL_ARB_buffer_storage, plus ARB_sync for the region fences.
+bool PersistentUniformApiReady()
+{
+    if (!g_bufferStorage || !g_mapBufferRange || !g_fenceSync ||
+        !g_clientWaitSync || !g_deleteSync || !g_genBuffers ||
+        !g_bindBuffer || !g_getIntegerv)
+        return false;
+    int major = 0;
+    int minor = 0;
+    __try
+    {
+        g_getIntegerv(GL_MAJOR_VERSION, &major);
+        g_getIntegerv(GL_MINOR_VERSION, &minor);
+        if (major > 4 || (major == 4 && minor >= 4))
+            return true;
+        if (!g_getString)
+            return false;
+        return HasExtensionToken(
+            reinterpret_cast<const char*>(g_getString(GL_EXTENSIONS)),
+            "GL_ARB_buffer_storage");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Allocates and maps the persistent ring. Leaves the new buffer bound to the
+// generic GL_UNIFORM_BUFFER target, the caller restores it.
+bool CreatePersistentUniformRing(unsigned& buffer, std::uint8_t*& base)
+{
+    buffer = 0;
+    base = nullptr;
+    const std::size_t totalBytes =
+        kUniformBufferBytes * static_cast<std::size_t>(kUniformBufferCount);
+    const unsigned flags =
+        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+    __try
+    {
+        g_genBuffers(1, &buffer);
+        if (buffer)
+        {
+            g_bindBuffer(GL_UNIFORM_BUFFER, buffer);
+            g_bufferStorage(
+                GL_UNIFORM_BUFFER,
+                static_cast<std::ptrdiff_t>(totalBytes),
+                nullptr,
+                flags);
+            // A failed glBufferStorage leaves no storage, the map then
+            // fails and returns null.
+            base = static_cast<std::uint8_t*>(
+                g_mapBufferRange(
+                    GL_UNIFORM_BUFFER,
+                    0,
+                    static_cast<std::ptrdiff_t>(totalBytes),
+                    flags));
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        base = nullptr;
+    }
+    if (base)
+        return true;
+    if (buffer && g_deleteBuffers)
+    {
+        __try { g_deleteBuffers(1, &buffer); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    buffer = 0;
+    return false;
+}
+
+bool CreateOrphanUniformBuffers(unsigned (&buffers)[kUniformBufferCount])
+{
+    for (unsigned& buffer : buffers)
+        buffer = 0;
+    bool setupOk = false;
+    __try
+    {
+        g_genBuffers(kUniformBufferCount, buffers);
+        setupOk = true;
+        for (int i = 0; i < kUniformBufferCount; ++i)
+        {
+            if (!buffers[i])
+            {
+                setupOk = false;
+                break;
+            }
+        }
+        for (int i = 0; setupOk && i < kUniformBufferCount; ++i)
+        {
+            g_bindBuffer(GL_UNIFORM_BUFFER, buffers[i]);
+            g_bufferData(
+                GL_UNIFORM_BUFFER,
+                static_cast<std::ptrdiff_t>(kUniformBufferBytes),
+                nullptr,
+                GL_STREAM_DRAW);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        setupOk = false;
+    }
+    return setupOk;
+}
+
+void DeleteUniformBufferNames(const unsigned* buffers, int count)
+{
+    if (!g_deleteBuffers)
+        return;
+    for (int i = 0; i < count; ++i)
+    {
+        if (!buffers[i])
+            continue;
+        // Repeated names (the persistent ring) are deleted once.
+        bool repeated = false;
+        for (int j = 0; j < i; ++j)
+            repeated = repeated || buffers[j] == buffers[i];
+        if (repeated)
+            continue;
+        __try { g_deleteBuffers(1, &buffers[i]); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
+// Same-context re-initialization (a later program setup step failed and
+// EnsureDirectProgram retries) must not leak the ring of the previous attempt.
+// Deleting the persistent buffer also unmaps it. Buffers of an older context
+// are dropped by ResetProgramForContext instead.
+void ReleaseUniformBuffersForContext()
+{
+    if (!g_uniformBufferReady ||
+        !worldvbo::ContextGenerationReady() ||
+        g_uniformBufferGeneration != worldvbo::ContextGeneration())
+        return;
+    unsigned names[kUniformBufferCount]{};
+    for (int i = 0; i < kUniformBufferCount; ++i)
+    {
+        UniformBufferFrame& frame = g_uniformBuffers[i];
+        names[i] = frame.buffer;
+        if (frame.fence && g_deleteSync)
+        {
+            __try { g_deleteSync(frame.fence); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        frame = {};
+    }
+    DeleteUniformBufferNames(names, kUniformBufferCount);
+    g_uniformPersistentBase = nullptr;
+    g_uniformBufferReady = false;
+    ClearUniformBindingOwnership();
+}
+
 bool InitializeUniformBuffers(unsigned program)
 {
     if (!program || !UniformBufferApiReady() ||
@@ -1693,6 +1920,8 @@ bool InitializeUniformBuffers(unsigned program)
     if (block == GL_INVALID_INDEX)
         return false;
 
+    ReleaseUniformBuffersForContext();
+
     // Reserve an actually unused indexed point, scanning high-to-low so we
     // stay out of the way of conventional low-numbered plugin bindings.
     unsigned binding = UINT_MAX;
@@ -1715,48 +1944,43 @@ bool InitializeUniformBuffers(unsigned program)
     if (!ReadGenericUniformBinding(previousGenericBinding))
         return false;
     unsigned buffers[kUniformBufferCount]{};
+    std::uint8_t* persistentBase = nullptr;
+    // Region bases are multiples of kUniformBufferBytes. Every bound range
+    // offset (region base + aligned offset) is therefore a multiple of
+    // GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT only when it divides the region size.
+    const bool persistentAligned =
+        kUniformBufferBytes % static_cast<std::size_t>(alignment) == 0u;
+    const bool persistentApi =
+        persistentAligned && PersistentUniformApiReady();
     bool setupOk = false;
-    __try
+    if (persistentApi)
     {
-        g_genBuffers(kUniformBufferCount, buffers);
-        setupOk = true;
-        for (int i = 0; i < kUniformBufferCount; ++i)
+        unsigned ring = 0;
+        if (CreatePersistentUniformRing(ring, persistentBase))
         {
-            if (!buffers[i])
-            {
-                setupOk = false;
-                break;
-            }
+            for (unsigned& buffer : buffers)
+                buffer = ring;
+            setupOk = true;
         }
-        for (int i = 0; setupOk && i < kUniformBufferCount; ++i)
-        {
-            g_bindBuffer(GL_UNIFORM_BUFFER, buffers[i]);
-            g_bufferData(
-                GL_UNIFORM_BUFFER,
-                static_cast<std::ptrdiff_t>(kUniformBufferBytes),
-                nullptr,
-                GL_STREAM_DRAW);
-        }
-        if (setupOk)
-            g_uniformBlockBinding(program, block, binding);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    if (!setupOk)
     {
-        setupOk = false;
+        persistentBase = nullptr;
+        setupOk = CreateOrphanUniformBuffers(buffers);
     }
+    if (setupOk)
+    {
+        __try { g_uniformBlockBinding(program, block, binding); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { setupOk = false; }
+    }
+    for (int i = 0; setupOk && i < kUniformBufferCount; ++i)
+        setupOk = buffers[i] != 0;
 
     const bool genericRestored =
         RestoreGenericUniformBinding(previousGenericBinding);
     if (!setupOk || !genericRestored)
     {
-        for (int i = 0; i < kUniformBufferCount; ++i)
-        {
-            if (buffers[i] && g_deleteBuffers)
-            {
-                __try { g_deleteBuffers(1, &buffers[i]); }
-                __except (EXCEPTION_EXECUTE_HANDLER) {}
-            }
-        }
+        DeleteUniformBufferNames(buffers, kUniformBufferCount);
         if (!genericRestored)
             (void)RestoreGenericUniformBinding(previousGenericBinding);
         return false;
@@ -1764,21 +1988,15 @@ bool InitializeUniformBuffers(unsigned program)
 
     for (int i = 0; i < kUniformBufferCount; ++i)
     {
-        if (!buffers[i])
-        {
-            for (int j = 0; j < kUniformBufferCount; ++j)
-            {
-                if (buffers[j] && g_deleteBuffers)
-                {
-                    __try { g_deleteBuffers(1, &buffers[j]); }
-                    __except (EXCEPTION_EXECUTE_HANDLER) {}
-                }
-            }
-            return false;
-        }
-        g_uniformBuffers[i].buffer = buffers[i];
+        UniformBufferFrame& frame = g_uniformBuffers[i];
+        frame.buffer = buffers[i];
+        frame.base = persistentBase
+            ? static_cast<std::size_t>(i) * kUniformBufferBytes
+            : 0u;
+        frame.fence = nullptr;
     }
 
+    g_uniformPersistentBase = persistentBase;
     g_uniformBufferAlignment = alignment;
     g_uniformBlockMaxSize = maxBlockSize;
     g_uniformBufferFrame = 0;
@@ -1795,6 +2013,98 @@ bool InitializeUniformBuffers(unsigned program)
     rendererlog::Line(
         "studio renderer: UBO constants ready block=%dKB alignment=%d binding=%u",
         maxBlockSize / 1024, alignment, binding);
+    if (persistentBase)
+    {
+        rendererlog::Line(
+            "studio renderer: UBO upload mode=persistent "
+            "(buffer_storage coherent ring %ux%uKB, fence per frame region)",
+            static_cast<unsigned>(kUniformBufferCount),
+            static_cast<unsigned>(kUniformBufferBytes / 1024u));
+    }
+    else
+    {
+        rendererlog::Line(
+            "studio renderer: UBO upload mode=orphan (map/subdata, %s)",
+            !persistentAligned
+                ? "alignment does not divide the frame region"
+                : persistentApi
+                      ? "persistent allocation failed"
+                      : "buffer_storage unavailable");
+    }
+    return true;
+}
+
+// Persistent mode: the region about to be reused was last written three
+// frames ago. Its fence has normally signaled long since, the blocking wait
+// is a safety net for a GPU queue running more than two frames behind.
+bool WaitUniformRegionFence(UniformBufferFrame& frame)
+{
+    if (!frame.fence)
+        return true;
+    unsigned status = 0;
+    __try
+    {
+        status = g_clientWaitSync(frame.fence, 0, 0);
+        if (status != GL_ALREADY_SIGNALED &&
+            status != GL_CONDITION_SATISFIED)
+        {
+            if (prof::Active())
+                ++g_uniformFenceWaits;
+            for (int attempt = 0; attempt < 4; ++attempt)
+            {
+                status = g_clientWaitSync(
+                    frame.fence,
+                    GL_SYNC_FLUSH_COMMANDS_BIT,
+                    250000000ull);
+                if (status == GL_ALREADY_SIGNALED ||
+                    status == GL_CONDITION_SATISFIED)
+                    break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    if (status != GL_ALREADY_SIGNALED &&
+        status != GL_CONDITION_SATISFIED)
+        return false;
+    __try { g_deleteSync(frame.fence); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    frame.fence = nullptr;
+    return true;
+}
+
+bool RotatePersistentUniformFrame(int nextFrame)
+{
+    UniformBufferFrame& next = g_uniformBuffers[nextFrame];
+    // On a failed wait the current region keeps filling linearly. Ranges are
+    // never rewritten within a frame, so staying on it is safe, the rotation
+    // is retried on the next frame.
+    if (!WaitUniformRegionFence(next))
+        return false;
+    UniformBufferFrame& current =
+        g_uniformBuffers[g_uniformBufferFrame];
+    if (current.fence)
+    {
+        __try { g_deleteSync(current.fence); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        current.fence = nullptr;
+    }
+    __try
+    {
+        current.fence =
+            g_fenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        current.fence = nullptr;
+    }
+    if (!current.fence)
+        return false;
+    g_uniformBufferFrame = nextFrame;
+    g_uniformBufferOffset = 0;
+    g_entityUniformKeyValid = false;
     return true;
 }
 
@@ -1807,6 +2117,8 @@ bool RotateUniformBufferFrame()
 
     const int nextFrame =
         (g_uniformBufferFrame + 1) % kUniformBufferCount;
+    if (g_uniformPersistentBase)
+        return RotatePersistentUniformFrame(nextFrame);
     UniformBufferFrame& frame =
         g_uniformBuffers[nextFrame];
     if (!frame.buffer)
@@ -2575,9 +2887,36 @@ std::uint64_t g_instancedDrawCalls = 0;
 std::uint64_t g_instancedEntities = 0;
 std::uint64_t g_instancedSavedDraws = 0;
 
+// Every reason a pending deferred run can be submitted. Barriers that are
+// order-independent for opaque depth-written packets are counted as skips.
+enum class FlushTrigger : unsigned
+{
+    PassBegin,
+    PassEnd,
+    Brush,
+    Sprite,
+    Shadow,
+    Glow,
+    DrawModel,
+    DrawPlayer,
+    Fallback,
+    Immediate,
+    MatrixSplit,
+    Count
+};
+
+constexpr unsigned kFlushTriggerCount =
+    static_cast<unsigned>(FlushTrigger::Count);
+constexpr const char* kFlushTriggerNames[kFlushTriggerCount] = {
+    "passBegin", "passEnd", "brush", "sprite", "shadow", "glow",
+    "drawModel", "drawPlayer", "fallback", "immediate", "matrix"
+};
+
 // Profiling-only flush statistics, reset after every periodic report.
 struct FlushProfileStats
 {
+    std::uint64_t siteFlushes[kFlushTriggerCount]{};
+    std::uint64_t siteSkips[kFlushTriggerCount]{};
     std::uint64_t frames = 0;
     std::uint64_t flushes = 0;
     std::uint64_t records = 0;
@@ -2899,6 +3238,229 @@ bool AdditiveEntryStateReady()
     {
         return false;
     }
+}
+
+// Barrier order-independence.
+//
+// Pending deferred packets are opaque: depth-tested, depth-written, blend
+// forced off by the flush. Any other draw that is itself opaque, depth-tested
+// and depth-writing produces the same color and depth per pixel whether it
+// reaches GL before or after them, so the barrier in front of it can be
+// skipped. Only exact equal-depth ties between different entities could
+// differ, the tolerance the instancing reorder already accepts. Blended,
+// additive, non-depth-writing or non-depth-tested draws depend on what is
+// already in the framebuffer and still flush first.
+//
+// The flush itself queries and restores every GL state it changes (program,
+// VAO, TMU0 binding and env, shade model, blend, depth write, UBO targets),
+// so a later flush leaves the stock draw sequence untouched. GL matrices are
+// re-verified on the next record after any skipped barrier, see
+// g_deferredRunMatricesVerify.
+bool g_deferredRunMatricesVerify = false;
+
+bool DepthOrderedOpaqueGlState()
+{
+    if (!g_isEnabled || !g_getIntegerv)
+        return false;
+    int depthWrite = 0;
+    __try
+    {
+        if (g_isEnabled(GL_BLEND) != 0 ||
+            g_isEnabled(GL_DEPTH_TEST) == 0)
+            return false;
+        g_getIntegerv(GL_DEPTH_WRITEMASK, &depthWrite);
+        return depthWrite != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool ReadCurrentEntityRender(int& modelType, int& renderMode, int& renderFx)
+{
+    modelType = -1;
+    renderMode = -1;
+    renderFx = -1;
+    if (!g_hwBase)
+        return false;
+    __try
+    {
+        const std::uint8_t* const entity =
+            *reinterpret_cast<const std::uint8_t* const*>(
+                g_hwBase + kCurrentEntityRva);
+        if (!entity)
+            return false;
+        const std::uint8_t* const model =
+            *reinterpret_cast<const std::uint8_t* const*>(
+                entity + 0xB94);
+        if (!model)
+            return false;
+        modelType = *reinterpret_cast<const int*>(model + 0x44);
+        renderMode = *reinterpret_cast<const int*>(entity + 0x2F8);
+        renderFx = *reinterpret_cast<const int*>(entity + 0x304);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Solid-pass brush entity (mod_brush, kRenderNormal, no fx). Stock
+// R_DrawBrushModel draws opaque or alpha-tested surfaces with depth writes
+// inside R_RotateForEntity's push/pop. Its decals blend, but they are
+// coplanar with the brush's own depth-written surfaces: a packet in front
+// covers brush and decal in either order, a packet behind is rejected by the
+// brush depth in either order.
+bool BrushDrawOrderIndependent()
+{
+    int modelType = -1;
+    int renderMode = -1;
+    int renderFx = -1;
+    return g_solidEntityPassDepth > 0 &&
+           ReadCurrentEntityRender(modelType, renderMode, renderFx) &&
+           modelType == 0 && renderMode == 0 && renderFx == 0 &&
+           DepthOrderedOpaqueGlState();
+}
+
+// Solid-pass sprite with kRenderNormal and the sprite blend cvar at 0: stock
+// R_DrawSpriteModel disables GL_BLEND and enables GL_ALPHA_TEST before its
+// quad and inherits depth test/write, which must already be on. The texture
+// matrix variant stays a barrier.
+bool SpriteDrawOrderIndependent()
+{
+    int modelType = -1;
+    int renderMode = -1;
+    int renderFx = -1;
+    if (g_solidEntityPassDepth <= 0 ||
+        !ReadCurrentEntityRender(modelType, renderMode, renderFx) ||
+        modelType != 1 || renderMode != 0 || renderFx != 0)
+        return false;
+    __try
+    {
+        if (*reinterpret_cast<const int*>(
+                g_hwBase + kSpriteTextureMatrixRva) != 0 ||
+            *reinterpret_cast<const int*>(
+                g_hwBase + kSpriteBlendRva) != 0)
+            return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return DepthOrderedOpaqueGlState();
+}
+
+// Stock StudioDrawModel from the exact solid-pass callsite for a kRenderNormal
+// studio entity without fx or forced face flags. Its framebuffer output is
+// the hooked DrawPoints (each one re-evaluated by the fallback barrier) and
+// the client shadow (its own unconditional barrier, so the shadow hook must
+// be live). The glow-shell branch keeps its boundary flush in gl_state.
+bool StockDrawModelOrderIndependent(int flags, void* caller)
+{
+    if (flags != 3 ||
+        ReadMode() != 1 ||
+        !g_deferredBarriersReady ||
+        !g_clientStudioShadowBarrierReady ||
+        g_solidEntityPassDepth <= 0 ||
+        !g_hwBase ||
+        caller != g_hwBase + kSolidDrawModelReturnRva ||
+        !ReadExactRDrawEntitiesNormal())
+        return false;
+    int modelType = -1;
+    int renderMode = -1;
+    int renderFx = -1;
+    if (!ReadCurrentEntityRender(modelType, renderMode, renderFx) ||
+        modelType != 3 || renderMode != 0 || renderFx != 0)
+        return false;
+    __try
+    {
+        return *reinterpret_cast<const std::uint32_t*>(
+                   g_hwBase + kForceFaceFlagsRva) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// True when no mesh of the current submodel resolves to an ADDITIVE texture
+// for the entity's skin family, mirroring Gold's skin selection.
+bool CurrentSubmodelWithoutAdditive(const DirectGlobals& state)
+{
+    const StudioHeaderRaw* textureHeader = ResolveTextureHeaderSafe();
+    if (!textureHeader || !state.header || !state.currentModel ||
+        state.skin < 0)
+        return false;
+    __try
+    {
+        if (textureHeader->id != 0x54534449 ||
+            textureHeader->version != 10 ||
+            textureHeader->numtextures <= 0 ||
+            textureHeader->numtextures > 4096 ||
+            textureHeader->numskinref <= 0 ||
+            textureHeader->numskinref > 4096 ||
+            textureHeader->numskinfamilies <= 0 ||
+            textureHeader->numskinfamilies > 256)
+            return false;
+        const StudioModelRaw* const model = state.currentModel;
+        if (model->nummesh < 0 || model->nummesh > 4096)
+            return false;
+        if (model->nummesh == 0)
+            return true;
+        const StudioMeshRaw* const meshes =
+            HeaderArray<StudioMeshRaw>(
+                state.header, model->meshindex, model->nummesh);
+        const int skinRefs = textureHeader->numskinref;
+        const std::int16_t* const skinTable =
+            HeaderArray<std::int16_t>(
+                textureHeader, textureHeader->skinindex,
+                skinRefs * textureHeader->numskinfamilies);
+        const StudioTextureRaw* const textures =
+            HeaderArray<StudioTextureRaw>(
+                textureHeader, textureHeader->textureindex,
+                textureHeader->numtextures);
+        if (!meshes || !skinTable || !textures)
+            return false;
+        const int family =
+            state.skin < textureHeader->numskinfamilies ? state.skin : 0;
+        for (int i = 0; i < model->nummesh; ++i)
+        {
+            const int skinref = meshes[i].skinref;
+            if (skinref < 0 || skinref >= skinRefs)
+                return false;
+            const int slot = skinTable[family * skinRefs + skinref];
+            if (slot < 0 || slot >= textureHeader->numtextures ||
+                (static_cast<unsigned>(textures[slot].flags) & 0x20u) != 0u)
+                return false;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Stock DrawPoints about to run for the current entity: kRenderNormal, no
+// setup render mode, no fx (glow shell), no forced face flags, ordinary debug
+// mode, opaque depth-tested and depth-written GL state at entry, and no
+// ADDITIVE mesh (stock enables ONE/ONE blending without depth writes for
+// those). MASKED meshes are alpha-tested with depth writes and CHROME meshes
+// are opaque, both stay order-independent.
+bool StockDrawPointsOrderIndependent()
+{
+    DirectGlobals state{};
+    if (!ReadDirectGlobals(state) ||
+        state.renderMode != 0 ||
+        state.setupRenderMode != 0 ||
+        state.renderFx != 0 ||
+        state.forceFlags != 0 ||
+        state.debugStudioMode >= 2)
+        return false;
+    return DepthOrderedOpaqueGlState() &&
+           CurrentSubmodelWithoutAdditive(state);
 }
 
 bool BeginMaskedMaterial()
@@ -4703,42 +5265,80 @@ bool UploadUniformBufferEntity(
     // The linked block remains 8192 bytes (128 records) for a single shader,
     // but only the compact prefix actually referenced by this submodel is
     // transferred. Typical player submodels use a small fraction of 128 bones.
-    const std::size_t paletteCount =
-        static_cast<std::size_t>(submodel.bonePaletteCount);
-    std::size_t packedFloats = 0;
-    if (!PackUniformBoneData(
-            state, submodel, g_boneBlockScratch,
-            kBoneBlockBytes / sizeof(float), packedFloats))
-        return false;
-    const std::size_t uploadBytes =
-        packedFloats * sizeof(float);
-
-    bool uploaded = false;
-    bool rangeBound = false;
-    __try
+    const bool collectTiming = prof::Active();
+    const std::size_t rangeOffset = frame.base + aligned;
+    if (g_uniformPersistentBase)
     {
-        g_bindBuffer(GL_UNIFORM_BUFFER, frame.buffer);
-        const bool collectTiming = prof::Active();
+        // Persistent ring: pack straight into the coherent mapping. The range
+        // is past every offset already handed out this frame and its region's
+        // fence was retired at rotation, so the GPU cannot be reading it.
         const long long uploadStart =
             collectTiming ? prof::Now() : 0;
-        g_bufferSubData(
-            GL_UNIFORM_BUFFER,
-            static_cast<std::ptrdiff_t>(aligned),
-            static_cast<std::ptrdiff_t>(uploadBytes),
-            g_boneBlockScratch);
+        std::size_t packedFloats = 0;
+        if (!PackUniformBoneData(
+                state, submodel,
+                reinterpret_cast<float*>(
+                    g_uniformPersistentBase + rangeOffset),
+                kBoneBlockBytes / sizeof(float), packedFloats))
+            return false;
         if (collectTiming)
         {
             g_directTiming.uboUploadTicks +=
                 prof::Now() - uploadStart;
             ++g_directTiming.uboUploads;
+            ++g_uniformPersistentWrites;
         }
+    }
+
+    bool uploaded = false;
+    bool rangeBound = false;
+    if (!g_uniformPersistentBase)
+    {
+        bool staged = false;
+        std::size_t packedFloats = 0;
+        if (!PackUniformBoneData(
+                state, submodel, g_boneBlockScratch,
+                kBoneBlockBytes / sizeof(float), packedFloats))
+            return false;
+        const std::size_t uploadBytes =
+            packedFloats * sizeof(float);
+        __try
+        {
+            g_bindBuffer(GL_UNIFORM_BUFFER, frame.buffer);
+            const long long uploadStart =
+                collectTiming ? prof::Now() : 0;
+            g_bufferSubData(
+                GL_UNIFORM_BUFFER,
+                static_cast<std::ptrdiff_t>(aligned),
+                static_cast<std::ptrdiff_t>(uploadBytes),
+                g_boneBlockScratch);
+            if (collectTiming)
+            {
+                g_directTiming.uboUploadTicks +=
+                    prof::Now() - uploadStart;
+                ++g_directTiming.uboUploads;
+            }
+            staged = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            staged = false;
+        }
+        if (!staged)
+        {
+            (void)RestoreKnownGenericUniformBinding();
+            return false;
+        }
+    }
+    __try
+    {
         const long long bindStart =
             collectTiming ? prof::Now() : 0;
         g_bindBufferRange(
             GL_UNIFORM_BUFFER,
             g_boneBlockBinding,
             frame.buffer,
-            static_cast<std::ptrdiff_t>(aligned),
+            static_cast<std::ptrdiff_t>(rangeOffset),
             static_cast<std::ptrdiff_t>(kBoneBlockBytes));
         rangeBound = true;
         if (collectTiming)
@@ -4757,7 +5357,7 @@ bool UploadUniformBufferEntity(
     // The reserved indexed point is module-owned (see g_lastUniformBlock*),
     // a failed upload leaves nothing foreign to restore there.
     if (rangeBound)
-        NoteOwnedUniformRange(frame.buffer, aligned, kBoneBlockBytes);
+        NoteOwnedUniformRange(frame.buffer, rangeOffset, kBoneBlockBytes);
     const bool genericRestored =
         RestoreKnownGenericUniformBinding();
     if (!uploaded || !genericRestored)
@@ -5332,7 +5932,7 @@ enum class FlushSite
     OutsideStudioDraw
 };
 
-bool FlushDeferredSolidCommands(FlushSite site);
+bool FlushDeferredSolidCommands(FlushSite site, FlushTrigger trigger);
 
 bool RecordDeferredDirectDraw(const DirectGlobals& state,
                               RetainedCache& cache,
@@ -5366,6 +5966,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     {
         g_deferredRunMatricesValid = false;
         g_deferredLastEntity = nullptr;
+        g_deferredRunMatricesVerify = false;
         // Once per barrier-delimited stretch of the pass, see g_passMatrices.
         if (!AcquireDirectMatrices(candidateMatrices))
             return false;
@@ -5377,15 +5978,21 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
             return false;
         // Production reuses the run matrices for every entity. While profiling,
         // one entity change in 256 is compared against live GL so a foreign
-        // per-entity matrix writer shows up in the report. A mismatch splits
-        // the run exactly like the former per-entity capture did.
-        if (state.entity != g_deferredLastEntity &&
-            rendererlog::StatsEnabled() &&
-            (++g_matrixVerifySequence & 0xFFu) == 0u)
+        // per-entity matrix writer shows up in the report. The first record
+        // after a skipped (order-independent) barrier is always compared,
+        // since stock brush/sprite/Studio code ran in between. A mismatch
+        // splits the run exactly like the former per-entity capture did.
+        const bool forcedVerify = g_deferredRunMatricesVerify;
+        if (forcedVerify ||
+            (state.entity != g_deferredLastEntity &&
+             rendererlog::StatsEnabled() &&
+             (++g_matrixVerifySequence & 0xFFu) == 0u))
         {
             if (!CaptureDirectMatrices(candidateMatrices))
                 return false;
-            ++g_flushProfile.matrixVerifies;
+            g_deferredRunMatricesVerify = false;
+            if (!forcedVerify || prof::Active())
+                ++g_flushProfile.matrixVerifies;
             if (std::memcmp(
                     &candidateMatrices,
                     &g_deferredRunMatrices,
@@ -5400,7 +6007,8 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
                         "entities without a barrier, deferred run split");
                 }
                 if (!FlushDeferredSolidCommands(
-                        FlushSite::InsideStudioDraw) ||
+                        FlushSite::InsideStudioDraw,
+                        FlushTrigger::MatrixSplit) ||
                     !g_deferredCommands.empty())
                     return false;
                 if (PassSnapshotsAllowed())
@@ -5818,6 +6426,11 @@ bool FlushDeferredSolidCommandsImpl()
     // blend/depth-write state and restore the caller's state afterwards.
     bool previousBlend = false;
     int previousDepthWrite = 1;
+    // TMU0 binding at flush entry. Right after a record it is the texture
+    // that packet left bound. Order-independent stock or immediate draws may
+    // have run since (see the skipped barriers), so the live binding is the
+    // value to hand back to Gold.
+    int previousTexture0 = 0;
     if (!ReadActiveTexture(previousActiveTexture))
         return false;
     __try
@@ -5836,6 +6449,9 @@ bool FlushDeferredSolidCommandsImpl()
         g_getIntegerv(
             GL_SHADE_MODEL,
             &previousShadeModel);
+        g_getIntegerv(
+            GL_TEXTURE_BINDING_2D,
+            &previousTexture0);
         previousBlend = g_isEnabled(GL_BLEND) != 0;
         g_getIntegerv(
             GL_DEPTH_WRITEMASK,
@@ -5860,16 +6476,52 @@ bool FlushDeferredSolidCommandsImpl()
     __try
     {
         // csgl3-style ordering: stage every constant block first. No draw is
-        // interleaved with a buffer write. Prefer one mapped range for the
-        // whole deferred run, this turns N driver uploads into one map/unmap
-        // while keeping fixed UBO offsets for every planned draw.
-        g_bindBuffer(
-            GL_UNIFORM_BUFFER, frame.buffer);
+        // interleaved with a buffer write. With the persistent ring the blocks
+        // are copied straight into the coherent mapping (the planned ranges
+        // lie past every offset already used this frame, and the region's
+        // fence was retired at rotation). Otherwise prefer one mapped range
+        // for the whole deferred run, this turns N driver uploads into one
+        // map/unmap while keeping fixed UBO offsets for every planned draw.
         bool batchUploaded = false;
+        bool persistentUploaded = false;
+        if (g_uniformPersistentBase)
+        {
+            std::uint8_t* const region =
+                g_uniformPersistentBase + frame.base;
+            bool copyOk = true;
+            for (const DeferredStudioCommand& command :
+                 g_deferredCommands)
+            {
+                const std::size_t bytes =
+                    command.boneFloatCount * sizeof(float);
+                if (command.uniformOffset > kUniformBufferBytes ||
+                    bytes > kUniformBufferBytes - command.uniformOffset)
+                {
+                    copyOk = false;
+                    break;
+                }
+                std::memcpy(
+                    region + command.uniformOffset,
+                    g_deferredBoneFloats.data() +
+                        command.boneFloatFirst,
+                    bytes);
+            }
+            if (!copyOk)
+                __leave;
+            persistentUploaded = true;
+            if (prof::Active())
+                g_uniformPersistentWrites += g_deferredCommands.size();
+        }
+        else
+        {
+            g_bindBuffer(
+                GL_UNIFORM_BUFFER, frame.buffer);
+        }
         const std::size_t mapStart =
             g_deferredGroups.front().uniformOffset;
         const std::size_t mapEnd = nextUniformOffset;
-        if (g_mapBufferRange && g_unmapBuffer &&
+        if (!persistentUploaded &&
+            g_mapBufferRange && g_unmapBuffer &&
             mapEnd >= mapStart &&
             mapEnd <= kUniformBufferBytes)
         {
@@ -5916,7 +6568,7 @@ bool FlushDeferredSolidCommandsImpl()
                 batchUploaded = copyOk && unmapped;
             }
         }
-        if (!batchUploaded)
+        if (!persistentUploaded && !batchUploaded)
         {
             ++g_deferredSubDataUploads;
             for (DeferredStudioCommand& command :
@@ -5935,7 +6587,7 @@ bool FlushDeferredSolidCommandsImpl()
                         command.boneFloatFirst);
             }
         }
-        else
+        else if (batchUploaded)
         {
             ++g_deferredMappedUploads;
         }
@@ -6034,11 +6686,11 @@ bool FlushDeferredSolidCommandsImpl()
                     g_boneBlockBinding,
                     frame.buffer,
                     static_cast<std::ptrdiff_t>(
-                        group.uniformOffset),
+                        frame.base + group.uniformOffset),
                     static_cast<std::ptrdiff_t>(
                         g_instancedBlockBytes));
                 rangeBound = true;
-                boundRangeOffset = group.uniformOffset;
+                boundRangeOffset = frame.base + group.uniformOffset;
                 boundRangeSize = g_instancedBlockBytes;
 
                 for (std::size_t member = 0;
@@ -6128,11 +6780,11 @@ bool FlushDeferredSolidCommandsImpl()
                 g_boneBlockBinding,
                 frame.buffer,
                 static_cast<std::ptrdiff_t>(
-                    command.uniformOffset),
+                    frame.base + command.uniformOffset),
                 static_cast<std::ptrdiff_t>(
                     kBoneBlockBytes));
             rangeBound = true;
-            boundRangeOffset = command.uniformOffset;
+            boundRangeOffset = frame.base + command.uniformOffset;
             boundRangeSize = kBoneBlockBytes;
             if (!colorBlendValid ||
                 std::memcmp(lastColorBlend, command.colorBlend,
@@ -6230,8 +6882,10 @@ bool FlushDeferredSolidCommandsImpl()
             static_cast<unsigned>(
                 previousVao));
         g_activeTexture(GL_TEXTURE0);
-        if (g_deferredEntryTextureValid)
-            g_goldBind(0, g_deferredEntryTexture);
+        if (previousTexture0 > 0)
+            g_goldBind(0, previousTexture0);
+        else if (g_deferredEntryTextureValid)
+            g_goldBind(0, static_cast<int>(g_deferredEntryTexture));
         g_texEnvi(
             GL_TEXTURE_ENV,
             GL_TEXTURE_ENV_MODE,
@@ -6306,11 +6960,21 @@ bool CurrentEntityIsPlayer()
     }
 }
 
+// A barrier that was proven order-independent for the pending run.
+void NoteBarrierSkip(FlushTrigger trigger)
+{
+    if (g_deferredCommands.empty())
+        return;
+    g_deferredRunMatricesVerify = true;
+    if (prof::Active())
+        ++g_flushProfile.siteSkips[static_cast<unsigned>(trigger)];
+}
+
 // Flushes from inside a Studio draw (retained kernel, client shadow provider,
 // glow-shell base pass) of a player already run inside studio.cpp's timed
 // StudioDrawPlayer. Every other flush is otherwise invisible to the Studio
 // phase and is charged here while profiling.
-bool FlushDeferredSolidCommands(FlushSite site)
+bool FlushDeferredSolidCommands(FlushSite site, FlushTrigger trigger)
 {
     if (g_deferredCommands.empty())
     {
@@ -6327,6 +6991,7 @@ bool FlushDeferredSolidCommands(FlushSite site)
     const bool flushed = FlushDeferredSolidCommandsImpl();
     const long long elapsed = prof::Now() - start;
     ++g_flushProfile.flushes;
+    ++g_flushProfile.siteFlushes[static_cast<unsigned>(trigger)];
     g_flushProfile.records += records;
     if (records > g_flushProfile.maxRecords)
         g_flushProfile.maxRecords = records;
@@ -6445,12 +7110,10 @@ bool TryDirectDraw(void* wrapperCaller)
 
     if (submodel.meshes.empty())
     {
+        // The stock blank-bodygroup fallback is evaluated by the fallback
+        // barrier in DirectKernelDispatch like any other stock DrawPoints.
         if (nonPlayerPhase1)
-        {
-            if (!g_deferredCommands.empty())
-                (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
             return DirectFallback(DirectFallbackReason::Submodel);
-        }
         const StudioModelRaw* blank = submodel.source;
         if (!blank || blank->nummesh != 0 || blank->numverts != 0 ||
             blank->numnorms != 0)
@@ -6570,16 +7233,30 @@ bool TryDirectDraw(void* wrapperCaller)
         return true;
     }
 
-    // A pending recorded player must become visible before any subsequent
-    // immediate/stock draw. This is the central ordering barrier.
-    if (!g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
-
     // Phase-1 non-player coverage is intentionally deferred-only.  If the
     // recorder cannot represent this exact DrawModel case, fail open to Gold
-    // rather than widening coverage through the immediate retained path.
+    // rather than widening coverage through the immediate retained path. The
+    // fallback barrier in DirectKernelDispatch orders that stock draw.
     if (nonPlayerPhase1)
         return DirectFallback(DirectFallbackReason::Execute);
+
+    // A pending recorded run must become visible before an immediate retained
+    // draw that is not order-independent of it. ADDITIVE meshes blend without
+    // depth writes. CHROME and MASKED-only entities (the usual reason the
+    // recorder declined) draw opaque or alpha-tested with depth writes, the
+    // same order-independent class as the pending packets. If the immediate
+    // draw fails, the stock replay is ordered by the fallback barrier. The
+    // immediate upload takes one block from the same frame region the flush
+    // will plan from, so the pending run must still fit after it.
+    if (!g_deferredCommands.empty())
+    {
+        if (!hasAdditive && DeferredCapacityAvailable() &&
+            DepthOrderedOpaqueGlState())
+            NoteBarrierSkip(FlushTrigger::Immediate);
+        else
+            (void)FlushDeferredSolidCommands(
+                FlushSite::InsideStudioDraw, FlushTrigger::Immediate);
+    }
 
     if (hasChrome)
     {
@@ -6641,8 +7318,17 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
         if (ReleaseOwnedDirectProgram())
             ++g_forcedProgramRestores;
     }
+    // Fallback barrier: Gold's stock DrawPoints runs next. Opaque, depth-
+    // written stock output is order-independent of the pending run, anything
+    // blended or additive needs the run in the framebuffer first.
     if (!direct && !g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
+    {
+        if (StockDrawPointsOrderIndependent())
+            NoteBarrierSkip(FlushTrigger::Fallback);
+        else
+            (void)FlushDeferredSolidCommands(
+                FlushSite::InsideStudioDraw, FlushTrigger::Fallback);
+    }
     if (collectTiming)
     {
         const long long elapsed = prof::Now() - attemptStart;
@@ -6778,6 +7464,12 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
                 TimingMicrosPerCall(
                     g_directTiming.fallbackAttemptTicks,
                     g_directTiming.fallbackAttemptCalls));
+            rendererlog::Line(
+                "studio renderer: ubo mode=%s persistentWrites=%llu "
+                "fenceWaits=%llu",
+                g_uniformPersistentBase ? "persistent" : "orphan",
+                static_cast<unsigned long long>(g_uniformPersistentWrites),
+                static_cast<unsigned long long>(g_uniformFenceWaits));
         }
     }
     return direct;
@@ -6811,13 +7503,23 @@ bool PatchRelativeCallTarget(std::uint8_t* callsite,
 // deferred run and end the current matrix / client-array snapshots.
 void __cdecl SolidBarrierFlush()
 {
-    (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+    // Brush barrier. An opaque solid-pass brush entity is order-independent
+    // of the pending run (BrushDrawOrderIndependent). Snapshots still end
+    // here, the brush rewrites client arrays and the matrix stack.
+    if (!g_deferredCommands.empty() && BrushDrawOrderIndependent())
+        NoteBarrierSkip(FlushTrigger::Brush);
+    else
+        (void)FlushDeferredSolidCommands(
+            FlushSite::OutsideStudioDraw, FlushTrigger::Brush);
     InvalidatePassSnapshots();
 }
 
 void __cdecl ShadowBarrierFlush()
 {
-    (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
+    // Kept unconditional: the shadow is blended over what is already in the
+    // framebuffer, so pending packets must land first.
+    (void)FlushDeferredSolidCommands(
+        FlushSite::InsideStudioDraw, FlushTrigger::Shadow);
     InvalidatePassSnapshots();
 }
 
@@ -6845,7 +7547,12 @@ __declspec(naked) void DrawBrushModelBarrierCall()
 bool __cdecl TryBeginSolidSpriteCapture()
 {
     InvalidatePassSnapshots();
-    if (!FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw))
+    // Sprite barrier, skipped for alpha-tested opaque solid sprites
+    // (SpriteDrawOrderIndependent).
+    if (!g_deferredCommands.empty() && SpriteDrawOrderIndependent())
+        NoteBarrierSkip(FlushTrigger::Sprite);
+    else if (!FlushDeferredSolidCommands(
+                 FlushSite::OutsideStudioDraw, FlushTrigger::Sprite))
     {
         spritevbo::Flush();
         return false;
@@ -7134,11 +7841,25 @@ void LogFlushProfile()
             ? 1000.0 / static_cast<double>(frequency.QuadPart)
             : 0.0;
     const double frames = static_cast<double>(stats.frames);
+    // Per trigger: flushes/frame and skipped (order-independent) barriers/frame.
+    char sites[640]{};
+    std::size_t used = 0;
+    for (unsigned i = 0; i < kFlushTriggerCount && used < sizeof(sites); ++i)
+    {
+        const int written = std::snprintf(
+            sites + used, sizeof(sites) - used, " %s=%.2f/%.2f",
+            kFlushTriggerNames[i],
+            static_cast<double>(stats.siteFlushes[i]) / frames,
+            static_cast<double>(stats.siteSkips[i]) / frames);
+        if (written <= 0)
+            break;
+        used += static_cast<std::size_t>(written);
+    }
     rendererlog::Line(
         "studio renderer: deferred flushes/frame=%.2f records/flush=%.2f "
         "maxRecords=%llu groups/flush=%.2f instGroups/frame=%.2f "
         "flushMs/frame=%.4f chargedMs/frame=%.4f matrixVerify=%llu "
-        "matrixMismatch=%llu frames=%llu",
+        "matrixMismatch=%llu frames=%llu sites(flush/skip):%s",
         static_cast<double>(stats.flushes) / frames,
         stats.flushes
             ? static_cast<double>(stats.records) /
@@ -7154,7 +7875,8 @@ void LogFlushProfile()
         static_cast<double>(stats.chargedTicks) * ticksToMs / frames,
         static_cast<unsigned long long>(stats.matrixVerifies),
         static_cast<unsigned long long>(stats.matrixMismatches),
-        static_cast<unsigned long long>(stats.frames));
+        static_cast<unsigned long long>(stats.frames),
+        sites);
     stats = {};
 }
 
@@ -7313,7 +8035,8 @@ void BeginSolidEntityPass()
     // A (nested) pass may run under different view matrices, so a pending
     // run is made visible and every snapshot restarts at each pass boundary.
     if (!g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+        (void)FlushDeferredSolidCommands(
+            FlushSite::OutsideStudioDraw, FlushTrigger::PassBegin);
     InvalidatePassSnapshots();
     ++g_solidEntityPassDepth;
     studio_drawbatch::SetClientArrayProofScope(PassSnapshotsAllowed());
@@ -7323,7 +8046,8 @@ void EndSolidEntityPass()
 {
     if (g_solidEntityPassDepth > 0)
     {
-        (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+        (void)FlushDeferredSolidCommands(
+            FlushSite::OutsideStudioDraw, FlushTrigger::PassEnd);
         --g_solidEntityPassDepth;
         if (g_solidEntityPassDepth == 0)
             EndPassSnapshotScope();
@@ -7335,13 +8059,36 @@ void EndSolidEntityPass()
 
 void FlushDeferredStudioCommands()
 {
-    // Glow-shell base pass boundary, reached from inside a Studio draw.
-    (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
+    // Glow-shell base pass boundary, reached from inside a Studio draw. Kept
+    // unconditional: the next pass is ONE/ONE additive without depth writes.
+    (void)FlushDeferredSolidCommands(
+        FlushSite::InsideStudioDraw, FlushTrigger::Glow);
 }
 
-void FlushSolidEntityCommands()
+void FlushBeforeStockDrawModel(int flags, void* caller)
 {
-    (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+    // A StudioDrawModel the recorder does not own. Opaque solid-pass studio
+    // entities only reach the framebuffer through the hooked DrawPoints and
+    // the client shadow, both of which keep their own barriers.
+    if (!g_deferredCommands.empty() &&
+        StockDrawModelOrderIndependent(flags, caller))
+        NoteBarrierSkip(FlushTrigger::DrawModel);
+    else
+        (void)FlushDeferredSolidCommands(
+            FlushSite::OutsideStudioDraw, FlushTrigger::DrawModel);
+    spritevbo::Flush();
+}
+
+void FlushBeforeDrawPlayer(int flags)
+{
+    // Without STUDIO_RENDER the call only sets up bones, attachments and
+    // events. Recorded packets already own copies of their bone palettes, so
+    // nothing pending is affected and nothing reaches the framebuffer.
+    if (!g_deferredCommands.empty() && (flags & 1) == 0)
+        NoteBarrierSkip(FlushTrigger::DrawPlayer);
+    else
+        (void)FlushDeferredSolidCommands(
+            FlushSite::OutsideStudioDraw, FlushTrigger::DrawPlayer);
     spritevbo::Flush();
 }
 } // namespace studio_renderer
