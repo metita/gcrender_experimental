@@ -85,6 +85,7 @@ constexpr std::uintptr_t kQglDeleteBuffersRva = 0x027E3DC8u;
 constexpr std::uintptr_t kQglGenBuffersRva = 0x027E3DCCu;
 constexpr std::uintptr_t kQglBufferDataRva = 0x027E3DB4u;
 constexpr std::uintptr_t kQglGetIntegervRva = 0x027E3DD0u;
+constexpr std::uintptr_t kGoldCurrentTmuRva = 0x027E35E0u;
 
 constexpr unsigned GL_ARRAY_BUFFER = 0x8892u;
 constexpr unsigned GL_ELEMENT_ARRAY_BUFFER = 0x8893u;
@@ -553,8 +554,11 @@ int g_instancedColorBlendLocation = -1;
 int g_instancedModelViewLocation = -1;
 int g_instancedProjectionLocation = -1;
 int g_instancedTextureMatrixLocation = -1;
+int g_instancedLayoutLocation = -1;
 unsigned g_instancedBoneBlockIndex = GL_INVALID_INDEX;
 unsigned g_instancedCapacity = 0;
+std::size_t g_instancedBlockBytes = 0;
+bool g_instancedProgramFailed = false;
 std::uint32_t g_instancedGammaFitRevision = 0;
 cl_enginefunc_t* g_engine = nullptr;
 
@@ -589,7 +593,13 @@ constexpr std::size_t kBoneBlockBytes =
     384u * sizeof(float) * 4u +
     128u * sizeof(float) * 4u;
 static_assert(kBoneBlockBytes == 8192u, "studio bone block size mismatch");
-constexpr unsigned kMaxStudioInstances = 2;
+// One std140 StudioBoneData record: row0, row1, row2, light.
+constexpr std::size_t kBoneRecordBytes = 4u * sizeof(float) * 4u;
+constexpr std::size_t kBoneRecordFloats = kBoneRecordBytes / sizeof(float);
+// Instanced draws read N compact per-entity palettes from one bound range.
+// The declared block is capped at 64 KB, the common GL_MAX_UNIFORM_BLOCK_SIZE.
+constexpr std::size_t kMaxInstancedBlockBytes = 64u * 1024u;
+constexpr unsigned kInstanceCap = 32;
 
 struct UniformBufferFrame
 {
@@ -603,9 +613,17 @@ int g_uniformBufferAlignment = 256;
 int g_uniformBlockMaxSize = 0;
 std::uint32_t g_uniformBufferGeneration = 0;
 bool g_uniformBufferReady = false;
+// The reserved indexed point is picked by InitializeUniformBuffers as a point
+// nobody had bound, and only programs created here reference it through
+// glUniformBlockBinding. Every Studio draw rebinds the exact range it reads,
+// so the point is module-owned: hot paths neither query nor restore it, they
+// only record the last range here. The generic GL_UNIFORM_BUFFER target is
+// likewise written only by this module and is returned to the value observed
+// when the ring buffers were created instead of being read back every use.
 std::size_t g_lastUniformBlockOffset = 0;
 std::size_t g_lastUniformBlockSize = 0;
 unsigned g_lastUniformBlockBuffer = 0;
+int g_genericUniformRestore = 0;
 alignas(16) float g_boneBlockScratch[kBoneBlockBytes / sizeof(float)]{};
 
 struct EntityUniformKey
@@ -1475,8 +1493,11 @@ void ResetProgramForContext(std::uint32_t generation)
     g_instancedModelViewLocation = -1;
     g_instancedProjectionLocation = -1;
     g_instancedTextureMatrixLocation = -1;
+    g_instancedLayoutLocation = -1;
     g_instancedBoneBlockIndex = GL_INVALID_INDEX;
     g_instancedCapacity = 0;
+    g_instancedBlockBytes = 0;
+    g_instancedProgramFailed = false;
     g_instancedGammaFitRevision = 0;
     g_gammaFitProgramRevision = 0;
     g_entityUniformKeyValid = false;
@@ -1496,6 +1517,7 @@ void ResetProgramForContext(std::uint32_t generation)
     g_lastUniformBlockOffset = 0;
     g_lastUniformBlockSize = 0;
     g_lastUniformBlockBuffer = 0;
+    g_genericUniformRestore = 0;
 }
 
 std::size_t AlignUp(std::size_t value, std::size_t alignment)
@@ -1573,47 +1595,6 @@ bool ReadIndexedUboBinding(unsigned binding,
     return true;
 }
 
-bool RestoreIndexedUboBinding(unsigned binding,
-                              const IndexedUboBinding& state)
-{
-    if (!g_bindBufferBase || !g_bindBufferRange)
-        return false;
-    const long long maxPtrdiff =
-        static_cast<long long>(
-            (std::numeric_limits<std::ptrdiff_t>::max)());
-    __try
-    {
-        switch (state.kind)
-        {
-        case IndexedUboKind::None:
-            g_bindBufferBase(GL_UNIFORM_BUFFER, binding, 0);
-            return true;
-        case IndexedUboKind::Base:
-            if (!state.buffer)
-                return false;
-            g_bindBufferBase(
-                GL_UNIFORM_BUFFER, binding, state.buffer);
-            return true;
-        case IndexedUboKind::Range:
-            if (!state.buffer || state.start < 0 || state.size <= 0 ||
-                state.start > maxPtrdiff || state.size > maxPtrdiff)
-                return false;
-            g_bindBufferRange(
-                GL_UNIFORM_BUFFER,
-                binding,
-                state.buffer,
-                static_cast<std::ptrdiff_t>(state.start),
-                static_cast<std::ptrdiff_t>(state.size));
-            return true;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-    return false;
-}
-
 bool ReadGenericUniformBinding(int& buffer)
 {
     buffer = 0;
@@ -1648,13 +1629,18 @@ bool RestoreGenericUniformBinding(int buffer)
     }
 }
 
-bool IndexedBindingIsOurs(const IndexedUboBinding& state)
+bool RestoreKnownGenericUniformBinding()
 {
-    return state.kind == IndexedUboKind::Range &&
-           g_lastUniformBlockBuffer != 0 &&
-           state.buffer == g_lastUniformBlockBuffer &&
-           state.start == static_cast<long long>(g_lastUniformBlockOffset) &&
-           state.size == static_cast<long long>(g_lastUniformBlockSize);
+    return RestoreGenericUniformBinding(g_genericUniformRestore);
+}
+
+void NoteOwnedUniformRange(unsigned buffer,
+                           std::size_t offset,
+                           std::size_t size)
+{
+    g_lastUniformBlockBuffer = buffer;
+    g_lastUniformBlockOffset = offset;
+    g_lastUniformBlockSize = size;
 }
 
 void ClearUniformBindingOwnership()
@@ -1804,6 +1790,7 @@ bool InitializeUniformBuffers(unsigned program)
     g_lastUniformBlockOffset = 0;
     g_lastUniformBlockSize = 0;
     g_lastUniformBlockBuffer = 0;
+    g_genericUniformRestore = previousGenericBinding;
     g_entityUniformKeyValid = false;
     rendererlog::Line(
         "studio renderer: UBO constants ready block=%dKB alignment=%d binding=%u",
@@ -1825,9 +1812,6 @@ bool RotateUniformBufferFrame()
     if (!frame.buffer)
         return false;
 
-    int previousGenericBinding = 0;
-    if (!ReadGenericUniformBinding(previousGenericBinding))
-        return false;
     bool orphaned = false;
     __try
     {
@@ -1846,7 +1830,7 @@ bool RotateUniformBufferFrame()
         orphaned = false;
     }
     const bool genericRestored =
-        RestoreGenericUniformBinding(previousGenericBinding);
+        RestoreKnownGenericUniformBinding();
     if (!orphaned || !genericRestored)
         return false;
     g_uniformBufferFrame = nextFrame;
@@ -1859,22 +1843,9 @@ void ReleaseUniformBufferBinding()
 {
     if (!g_useUniformBuffer || !g_uniformBufferReady ||
         !g_bindBufferBase || !g_bindBuffer ||
-        !g_getIntegeriV || !g_getInteger64iV || !g_getIntegerv)
+        g_lastUniformBlockBuffer == 0)
         return;
 
-    IndexedUboBinding indexed{};
-    if (!ReadIndexedUboBinding(g_boneBlockBinding, indexed))
-        return;
-    const bool wasOurs = IndexedBindingIsOurs(indexed);
-    if (!wasOurs)
-    {
-        ClearUniformBindingOwnership();
-        return;
-    }
-
-    int previousGenericBinding = 0;
-    if (!ReadGenericUniformBinding(previousGenericBinding))
-        return;
     bool released = false;
     __try
     {
@@ -1889,7 +1860,7 @@ void ReleaseUniformBufferBinding()
         released = false;
     }
     const bool genericRestored =
-        RestoreGenericUniformBinding(previousGenericBinding);
+        RestoreKnownGenericUniformBinding();
     if (released && genericRestored)
         ClearUniformBindingOwnership();
 }
@@ -2072,24 +2043,23 @@ unsigned CompileDirectProgram(bool useUniformBuffer)
     return program;
 }
 
-unsigned CompileInstancedProgram(unsigned capacity)
+unsigned CompileInstancedProgram(unsigned boneRecords, unsigned capacity)
 {
     if (!RefreshShaderFunctions() ||
-        (capacity != 2u && capacity != 4u && capacity != 8u))
+        boneRecords < 128u || capacity < 2u || capacity > kInstanceCap)
         return 0;
 
-    static const char* header2 =
+    // Each instance reads its own compact submodel palette. The CPU stages
+    // instance i at record i * uInstanceLayout.x of one bound range, so N
+    // entities sharing a submodel and material draw with one call per mesh.
+    char header[192]{};
+    std::snprintf(
+        header, sizeof(header),
         "#version 140\n"
         "#extension GL_ARB_compatibility : require\n"
-        "#define INSTANCE_CAP 2\n";
-    static const char* header4 =
-        "#version 140\n"
-        "#extension GL_ARB_compatibility : require\n"
-        "#define INSTANCE_CAP 4\n";
-    static const char* header8 =
-        "#version 140\n"
-        "#extension GL_ARB_compatibility : require\n"
-        "#define INSTANCE_CAP 8\n";
+        "#define BONE_RECORDS %u\n"
+        "#define INSTANCE_CAP %u\n",
+        boneRecords, capacity);
     static const char* declarations =
         "in vec3 aPosition;\n"
         "in vec3 aNormal;\n"
@@ -2103,13 +2073,14 @@ unsigned CompileInstancedProgram(unsigned capacity)
         "  vec4 light;\n"
         "};\n"
         "layout(std140) uniform StudioBoneConstants {\n"
-        "  StudioBoneData uBoneData[128 * INSTANCE_CAP];\n"
+        "  StudioBoneData uBoneData[BONE_RECORDS];\n"
         "};\n"
         "uniform mat4 uModelView;\n"
         "uniform mat4 uProjection;\n"
         "uniform mat4 uTextureMatrix;\n"
         "uniform vec4 uGammaFit0;\n"
         "uniform vec4 uGammaFit1;\n"
+        "uniform vec4 uInstanceLayout;\n"
         "uniform vec4 uInstanceParams[INSTANCE_CAP];\n"
         "uniform vec4 uInstanceColorBlend[INSTANCE_CAP];\n";
     static const char* body =
@@ -2123,7 +2094,7 @@ unsigned CompileInstancedProgram(unsigned capacity)
         "}\n"
         "void main() {\n"
         "  int iid = gl_InstanceID;\n"
-        "  int base = iid * 128;\n"
+        "  int base = iid * int(uInstanceLayout.x);\n"
         "  vec4 params = uInstanceParams[iid];\n"
         "  vec4 colorBlend = uInstanceColorBlend[iid];\n"
         "  int bi = int(aPositionBone);\n"
@@ -2155,8 +2126,6 @@ unsigned CompileInstancedProgram(unsigned capacity)
         "  gl_BackColor = c;\n"
         "}\n";
 
-    const char* header =
-        capacity == 8u ? header8 : (capacity == 4u ? header4 : header2);
     const char* sourceParts[3] = {header, declarations, body};
     unsigned shader = 0;
     unsigned program = 0;
@@ -2245,23 +2214,38 @@ bool EnsureInstancedProgram()
         !g_getUniformBlockIndex || g_uniformBlockMaxSize <= 0)
         return false;
     if (g_instancedProgram)
-        return g_instancedCapacity >= 2u;
-
-    // Phase 1 deliberately pairs only two consecutive single-draw entities.
-    // This keeps the UBO requirement at the OpenGL 3.1 minimum 16KB and avoids
-    // broadening ordering semantics before the pair path is runtime-validated.
-    if (g_uniformBlockMaxSize <
-        static_cast<int>(kBoneBlockBytes * kMaxStudioInstances))
+        return g_instancedCapacity >= 2u && g_instancedBlockBytes > 0;
+    // A failed compile/link is latched per GL context instead of being
+    // retried by every deferred flush.
+    if (g_instancedProgramFailed)
         return false;
-    const unsigned capacity = kMaxStudioInstances;
 
-    const unsigned program = CompileInstancedProgram(capacity);
+    std::size_t blockBytes =
+        (std::min)(static_cast<std::size_t>(g_uniformBlockMaxSize),
+                   kMaxInstancedBlockBytes);
+    blockBytes -= blockBytes % kBoneRecordBytes;
+    if (blockBytes < kBoneBlockBytes ||
+        blockBytes > kUniformBufferBytes)
+    {
+        g_instancedProgramFailed = true;
+        return false;
+    }
+    const unsigned boneRecords =
+        static_cast<unsigned>(blockBytes / kBoneRecordBytes);
+    const unsigned capacity = kInstanceCap;
+
+    const unsigned program =
+        CompileInstancedProgram(boneRecords, capacity);
     if (!program)
+    {
+        g_instancedProgramFailed = true;
         return false;
+    }
 
     unsigned block = GL_INVALID_INDEX;
     int gammaFit0 = -1;
     int gammaFit1 = -1;
+    int layout = -1;
     int params = -1;
     int colorBlend = -1;
     int modelView = -1;
@@ -2274,6 +2258,7 @@ bool EnsureInstancedProgram()
             program, "StudioBoneConstants");
         gammaFit0 = g_getUniformLocation(program, "uGammaFit0");
         gammaFit1 = g_getUniformLocation(program, "uGammaFit1");
+        layout = g_getUniformLocation(program, "uInstanceLayout");
         params = g_getUniformLocation(program, "uInstanceParams[0]");
         colorBlend =
             g_getUniformLocation(program, "uInstanceColorBlend[0]");
@@ -2282,7 +2267,7 @@ bool EnsureInstancedProgram()
         textureMatrix =
             g_getUniformLocation(program, "uTextureMatrix");
         if (block != GL_INVALID_INDEX &&
-            gammaFit0 >= 0 && gammaFit1 >= 0 &&
+            gammaFit0 >= 0 && gammaFit1 >= 0 && layout >= 0 &&
             params >= 0 && colorBlend >= 0 &&
             modelView >= 0 && projection >= 0 &&
             textureMatrix >= 0)
@@ -2300,12 +2285,14 @@ bool EnsureInstancedProgram()
     {
         __try { g_deleteProgram(program); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
+        g_instancedProgramFailed = true;
         return false;
     }
 
     g_instancedProgram = program;
     g_instancedGammaFit0Location = gammaFit0;
     g_instancedGammaFit1Location = gammaFit1;
+    g_instancedLayoutLocation = layout;
     g_instancedParamsLocation = params;
     g_instancedColorBlendLocation = colorBlend;
     g_instancedModelViewLocation = modelView;
@@ -2313,10 +2300,12 @@ bool EnsureInstancedProgram()
     g_instancedTextureMatrixLocation = textureMatrix;
     g_instancedBoneBlockIndex = block;
     g_instancedCapacity = capacity;
+    g_instancedBlockBytes = blockBytes;
     g_instancedGammaFitRevision = 0;
     rendererlog::Line(
-        "studio renderer: instancing program ready capacity=%u block=%dKB",
-        capacity, g_uniformBlockMaxSize / 1024);
+        "studio renderer: instancing program ready capacity=%u records=%u block=%uKB",
+        capacity, boneRecords,
+        static_cast<unsigned>(blockBytes / 1024u));
     return true;
 }
 
@@ -2547,14 +2536,34 @@ struct DeferredStudioCommand
     float shade = 0.0f;
     unsigned char mirror = 0;
     int rendererType = 1;
+    std::size_t bucket = 0;
+};
+
+// One flush draw group. count == 1 replays a command through the ordinary
+// program, count >= 2 draws that many bucketed commands with one instanced
+// call per mesh. Members are g_deferredOrder[orderFirst, orderFirst + count).
+struct DeferredDrawGroup
+{
+    std::size_t orderFirst = 0;
+    std::size_t count = 0;
+    std::size_t uniformOffset = 0;
+    std::size_t recordsPerInstance = 0;
 };
 
 std::vector<DeferredStudioCommand> g_deferredCommands;
 std::vector<DeferredMeshDraw> g_deferredMeshes;
 std::vector<float> g_deferredBoneFloats;
+std::vector<std::size_t> g_deferredOrder;
+std::vector<std::size_t> g_deferredBucketHeads;
+std::vector<DeferredDrawGroup> g_deferredGroups;
 DirectMatrices g_deferredRunMatrices{};
 bool g_deferredRunMatricesValid = false;
 const std::uint8_t* g_deferredLastEntity = nullptr;
+// TMU0 texture Gold-visibly bound by the latest recorded packet. A flush
+// rebinds it through Gold's own bind so GL and Gold's texture cache end the
+// flush exactly where the last recorded DrawPoints left them.
+unsigned g_deferredEntryTexture = 0;
+bool g_deferredEntryTextureValid = false;
 bool g_deferredFlushInProgress = false;
 std::uint64_t g_deferredRecorded = 0;
 std::uint64_t g_deferredFlushed = 0;
@@ -2566,33 +2575,112 @@ std::uint64_t g_instancedDrawCalls = 0;
 std::uint64_t g_instancedEntities = 0;
 std::uint64_t g_instancedSavedDraws = 0;
 
-bool DeferredCommandsCanInstancePair(
+// Profiling-only flush statistics, reset after every periodic report.
+struct FlushProfileStats
+{
+    std::uint64_t frames = 0;
+    std::uint64_t flushes = 0;
+    std::uint64_t records = 0;
+    std::uint64_t maxRecords = 0;
+    std::uint64_t groups = 0;
+    std::uint64_t instancedGroups = 0;
+    std::uint64_t matrixVerifies = 0;
+    std::uint64_t matrixMismatches = 0;
+    long long ticks = 0;
+    long long chargedTicks = 0;
+};
+
+FlushProfileStats g_flushProfile{};
+std::uint32_t g_matrixVerifySequence = 0;
+bool g_matrixMismatchLogged = false;
+
+// Matrices captured once per barrier-delimited stretch of the solid entity
+// pass. Inside that stretch only client Studio code and Gold's world-space
+// Studio kernel run between two DrawPoints calls. Neither touches the GL
+// modelview, projection or texture matrix: Studio vertices are transformed by
+// the CPU bone matrices, which already contain the entity origin and angles,
+// and every stock entity draw relies on entering with the pass view matrix.
+// Brush, sprite and shadow draws (R_RotateForEntity push/pop and foreign
+// providers) are deferred-flush barriers and invalidate this snapshot.
+DirectMatrices g_passMatrices{};
+bool g_passMatricesValid = false;
+std::uint32_t g_passMatricesGeneration = 0;
+
+bool DeferredCommandsShareInstanceKey(
     const DeferredStudioCommand& first,
     const DeferredStudioCommand& second)
 {
-    if (g_instancedCapacity != 2u ||
-        !first.cache || first.cache != second.cache ||
+    if (!first.cache || first.cache != second.cache ||
         !first.submodel || first.submodel != second.submodel ||
-        first.meshCount != 1u || second.meshCount != 1u ||
-        first.rendererType != 1 || second.rendererType != 1 ||
+        first.rendererType != second.rendererType ||
         first.mirror != second.mirror ||
-        first.uniformOffset > SIZE_MAX - kBoneBlockBytes ||
-        second.uniformOffset != first.uniformOffset + kBoneBlockBytes ||
-        first.uniformOffset > kUniformBufferBytes ||
-        kBoneBlockBytes * 2u >
-            kUniformBufferBytes - first.uniformOffset ||
-        first.meshFirst >= g_deferredMeshes.size() ||
-        second.meshFirst >= g_deferredMeshes.size())
+        first.meshCount != second.meshCount ||
+        first.boneFloatCount != second.boneFloatCount ||
+        first.meshFirst > g_deferredMeshes.size() ||
+        first.meshCount > g_deferredMeshes.size() - first.meshFirst ||
+        second.meshFirst > g_deferredMeshes.size() ||
+        second.meshCount > g_deferredMeshes.size() - second.meshFirst)
         return false;
 
-    const DeferredMeshDraw& a = g_deferredMeshes[first.meshFirst];
-    const DeferredMeshDraw& b = g_deferredMeshes[second.meshFirst];
-    return a.firstIndex == b.firstIndex &&
-           a.indexCount == b.indexCount &&
-           a.glId == b.glId &&
-           a.flags == b.flags &&
-           a.sScale == b.sScale &&
-           a.tScale == b.tScale;
+    for (std::size_t meshIndex = 0;
+         meshIndex < first.meshCount; ++meshIndex)
+    {
+        const DeferredMeshDraw& a =
+            g_deferredMeshes[first.meshFirst + meshIndex];
+        const DeferredMeshDraw& b =
+            g_deferredMeshes[second.meshFirst + meshIndex];
+        if (a.firstIndex != b.firstIndex ||
+            a.indexCount != b.indexCount ||
+            a.glId != b.glId ||
+            a.flags != b.flags ||
+            a.sScale != b.sScale ||
+            a.tScale != b.tScale)
+            return false;
+    }
+    return true;
+}
+
+// Gold keeps its selected TMU in a private shadow that its own GL_Bind and
+// texture-env code depend on (gl_state's Studio texenv filter reads the same
+// value). Reading it avoids a synchronous GL_ACTIVE_TEXTURE query.
+bool ReadGoldActiveTexture(int& texture)
+{
+    texture = static_cast<int>(GL_TEXTURE0);
+    if (!g_hwBase)
+        return false;
+    int unit = -1;
+    __try
+    {
+        unit = *reinterpret_cast<const int*>(
+            g_hwBase + kGoldCurrentTmuRva);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    if (unit < 0 || unit >= 32)
+        return false;
+    texture = static_cast<int>(GL_TEXTURE0) + unit;
+    return true;
+}
+
+bool ReadActiveTexture(int& texture)
+{
+    if (ReadGoldActiveTexture(texture))
+        return true;
+    texture = static_cast<int>(GL_TEXTURE0);
+    if (!g_getIntegerv)
+        return false;
+    __try
+    {
+        g_getIntegerv(GL_ACTIVE_TEXTURE, &texture);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        texture = static_cast<int>(GL_TEXTURE0);
+        return false;
+    }
 }
 
 bool CaptureDirectMatrices(DirectMatrices& out)
@@ -2600,11 +2688,12 @@ bool CaptureDirectMatrices(DirectMatrices& out)
     if (!g_getFloatv || !g_getIntegerv || !g_activeTexture)
         return false;
     int previousActiveTexture = static_cast<int>(GL_TEXTURE0);
+    if (!ReadActiveTexture(previousActiveTexture))
+        return false;
     __try
     {
         g_getFloatv(GL_MODELVIEW_MATRIX, out.modelView);
         g_getFloatv(GL_PROJECTION_MATRIX, out.projection);
-        g_getIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
         if (previousActiveTexture != static_cast<int>(GL_TEXTURE0))
             g_activeTexture(GL_TEXTURE0);
         g_getFloatv(GL_TEXTURE_MATRIX, out.texture);
@@ -2622,6 +2711,44 @@ bool CaptureDirectMatrices(DirectMatrices& out)
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         return false;
     }
+}
+
+bool PassSnapshotsAllowed()
+{
+    return g_solidEntityPassDepth > 0 &&
+           g_deferredBarriersReady &&
+           g_clientStudioShadowBarrierReady &&
+           worldvbo::ContextGenerationReady();
+}
+
+void InvalidatePassSnapshots()
+{
+    g_passMatricesValid = false;
+    studio_drawbatch::InvalidateClientArrayProof();
+}
+
+// Returns the pass matrix snapshot, capturing it on first use after a
+// barrier. Outside a barrier-guarded solid pass this is a plain capture.
+bool AcquireDirectMatrices(DirectMatrices& out)
+{
+    if (!PassSnapshotsAllowed())
+        return CaptureDirectMatrices(out);
+    const std::uint32_t generation = worldvbo::ContextGeneration();
+    if (g_passMatricesValid &&
+        g_passMatricesGeneration == generation)
+    {
+        out = g_passMatrices;
+        return true;
+    }
+    if (!CaptureDirectMatrices(out))
+    {
+        g_passMatricesValid = false;
+        return false;
+    }
+    g_passMatrices = out;
+    g_passMatricesGeneration = generation;
+    g_passMatricesValid = true;
+    return true;
 }
 
 bool UploadDirectMatrices(const DirectMatrices& matrices)
@@ -2877,10 +3004,11 @@ bool DirectGlStateReady(bool useVertexArray,
     int currentProgram = -1;
     int activeTexture = -1;
     int textureEnvMode = -1;
+    if (!ReadActiveTexture(activeTexture))
+        return false;
     __try
     {
         g_getIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
-        g_getIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
         if (!g_getTexEnviv)
             return false;
         g_getTexEnviv(
@@ -4527,9 +4655,6 @@ bool PackUniformBoneData(const DirectGlobals& state,
     return true;
 }
 
-bool ReadReservedUniformBinding(IndexedUboBinding& state,
-                                bool& wasOurs);
-
 bool UploadUniformBufferEntity(
     const DirectGlobals& state,
     const RetainedSubmodel& submodel,
@@ -4545,16 +4670,6 @@ bool UploadUniformBufferEntity(
     UniformBufferFrame& frame =
         g_uniformBuffers[g_uniformBufferFrame];
     if (!frame.buffer)
-        return false;
-
-    IndexedUboBinding reserved{};
-    bool reservedWasOurs = false;
-    if (!ReadReservedUniformBinding(
-            reserved, reservedWasOurs))
-        return false;
-    // Immediate submission cannot borrow a third-party indexed point because
-    // Gold/foreign GL may execute again before this function restores state.
-    if (reserved.kind != IndexedUboKind::None && !reservedWasOurs)
         return false;
 
     const std::size_t aligned =
@@ -4581,10 +4696,8 @@ bool UploadUniformBufferEntity(
     const std::size_t uploadBytes =
         packedFloats * sizeof(float);
 
-    int previousGenericBinding = 0;
-    if (!ReadGenericUniformBinding(previousGenericBinding))
-        return false;
     bool uploaded = false;
+    bool rangeBound = false;
     __try
     {
         g_bindBuffer(GL_UNIFORM_BUFFER, frame.buffer);
@@ -4610,6 +4723,7 @@ bool UploadUniformBufferEntity(
             frame.buffer,
             static_cast<std::ptrdiff_t>(aligned),
             static_cast<std::ptrdiff_t>(kBoneBlockBytes));
+        rangeBound = true;
         if (collectTiming)
         {
             g_directTiming.uboBindTicks +=
@@ -4623,17 +4737,16 @@ bool UploadUniformBufferEntity(
         uploaded = false;
     }
 
-    if (!uploaded)
-        (void)RestoreIndexedUboBinding(g_boneBlockBinding, reserved);
+    // The reserved indexed point is module-owned (see g_lastUniformBlock*),
+    // a failed upload leaves nothing foreign to restore there.
+    if (rangeBound)
+        NoteOwnedUniformRange(frame.buffer, aligned, kBoneBlockBytes);
     const bool genericRestored =
-        RestoreGenericUniformBinding(previousGenericBinding);
+        RestoreKnownGenericUniformBinding();
     if (!uploaded || !genericRestored)
         return false;
 
     g_uniformBufferOffset = aligned + kBoneBlockBytes;
-    g_lastUniformBlockOffset = aligned;
-    g_lastUniformBlockSize = kBoneBlockBytes;
-    g_lastUniformBlockBuffer = frame.buffer;
     g_lastEntityUniformKey = key;
     g_entityUniformKeyValid = true;
     return true;
@@ -4847,7 +4960,7 @@ bool ExecuteDirectDraw(const DirectGlobals& state,
     const bool usingVertexArray =
         cache.vertexArray != 0 && g_bindVertexArray != nullptr;
     DirectMatrices matrices{};
-    if (g_useUniformBuffer && !CaptureDirectMatrices(matrices))
+    if (g_useUniformBuffer && !AcquireDirectMatrices(matrices))
         return false;
 
     const bool collectTiming = prof::Active();
@@ -5137,26 +5250,7 @@ bool DeferredCapacityAvailable()
     return count - 1u <= (lastStartLimit - first) / stride;
 }
 
-bool ReadReservedUniformBinding(IndexedUboBinding& state,
-                                bool& wasOurs)
-{
-    state = {};
-    wasOurs = false;
-    if (!g_getIntegeriV || !g_getInteger64iV || !g_useUniformBuffer ||
-        !g_uniformBufferReady)
-        return false;
-    if (!ReadIndexedUboBinding(g_boneBlockBinding, state))
-        return false;
-    wasOurs = IndexedBindingIsOurs(state);
-    if (wasOurs &&
-        (g_lastUniformBlockOffset > kUniformBufferBytes ||
-         g_lastUniformBlockSize >
-             kUniformBufferBytes - g_lastUniformBlockOffset))
-        return false;
-    return true;
-}
-
-bool DeferredReplayReady(bool validateReservedBinding)
+bool DeferredReplayReady()
 {
     if (!studio::HooksReady() ||
         !g_useUniformBuffer ||
@@ -5168,32 +5262,18 @@ bool DeferredReplayReady(bool validateReservedBinding)
         !g_bindVertexArray ||
         !g_bindBuffer ||
         !g_bindBufferRange ||
-        !g_bindBufferBase ||
         !g_bufferSubData ||
         !g_getIntegerv ||
-        !g_getIntegeriV ||
-        !g_getInteger64iV ||
-        !g_isEnabled ||
         !g_activeTexture ||
         !g_texEnvi ||
         !g_getTexEnviv ||
         !g_shadeModel ||
-        !g_cullFace ||
-        !g_enable ||
-        !g_disable ||
         !g_goldBind ||
         !g_drawElements)
         return false;
     const UniformBufferFrame& frame =
         g_uniformBuffers[g_uniformBufferFrame];
-    if (!frame.buffer)
-        return false;
-    if (!validateReservedBinding)
-        return true;
-    IndexedUboBinding indexed{};
-    bool indexedWasOurs = false;
-    return ReadReservedUniformBinding(
-        indexed, indexedWasOurs);
+    return frame.buffer != 0;
 }
 
 bool CaptureDeferredCullState(unsigned char& mirror,
@@ -5229,23 +5309,24 @@ void BindGoldTextureSafe(unsigned glId)
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-bool FlushDeferredSolidCommands();
+enum class FlushSite
+{
+    InsideStudioDraw,
+    OutsideStudioDraw
+};
+
+bool FlushDeferredSolidCommands(FlushSite site);
 
 bool RecordDeferredDirectDraw(const DirectGlobals& state,
                               RetainedCache& cache,
                               const RetainedSubmodel& submodel)
 {
-    // The reserved indexed UBO point is queried once before the first packet
-    // in a run. FlushDeferredSolidCommands queries it again immediately before
-    // touching GL and restores that exact state afterwards. Repeating the
-    // synchronous indexed-binding queries for every player adds no extra
-    // compatibility guarantee between those two boundaries.
-    const bool validateReservedBinding =
-        g_deferredCommands.empty();
+    // The reserved indexed UBO point is module-owned and the flush rebinds the
+    // exact range of every draw, so recording never reads it back.
     if (g_deferredFlushInProgress ||
         !g_deferredBarriersReady ||
         g_solidEntityPassDepth <= 0 ||
-        !DeferredReplayReady(validateReservedBinding) ||
+        !DeferredReplayReady() ||
         !cache.vertexArray ||
         !g_bindVertexArray ||
         !DeferredCapacityAvailable() ||
@@ -5264,37 +5345,56 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
 
     DirectMatrices candidateMatrices{};
     bool commitRunMatrices = false;
-    bool commitLastEntity = false;
     if (g_deferredCommands.empty())
     {
         g_deferredRunMatricesValid = false;
         g_deferredLastEntity = nullptr;
-        if (!CaptureDirectMatrices(candidateMatrices))
+        // Once per barrier-delimited stretch of the pass, see g_passMatrices.
+        if (!AcquireDirectMatrices(candidateMatrices))
             return false;
         commitRunMatrices = true;
-        commitLastEntity = true;
     }
     else
     {
         if (!g_deferredRunMatricesValid)
             return false;
-        if (state.entity != g_deferredLastEntity)
+        // Production reuses the run matrices for every entity. While profiling,
+        // one entity change in 256 is compared against live GL so a foreign
+        // per-entity matrix writer shows up in the report. A mismatch splits
+        // the run exactly like the former per-entity capture did.
+        if (state.entity != g_deferredLastEntity &&
+            rendererlog::StatsEnabled() &&
+            (++g_matrixVerifySequence & 0xFFu) == 0u)
         {
             if (!CaptureDirectMatrices(candidateMatrices))
                 return false;
+            ++g_flushProfile.matrixVerifies;
             if (std::memcmp(
                     &candidateMatrices,
                     &g_deferredRunMatrices,
                     sizeof(candidateMatrices)) != 0)
             {
-                // Foreign/plugin matrix changes split the run before this
-                // packet is accepted. The already accepted run stays exact.
-                if (!FlushDeferredSolidCommands() ||
+                ++g_flushProfile.matrixMismatches;
+                if (!g_matrixMismatchLogged)
+                {
+                    g_matrixMismatchLogged = true;
+                    rendererlog::Line(
+                        "studio renderer: GL matrices changed between Studio "
+                        "entities without a barrier, deferred run split");
+                }
+                if (!FlushDeferredSolidCommands(
+                        FlushSite::InsideStudioDraw) ||
                     !g_deferredCommands.empty())
                     return false;
+                if (PassSnapshotsAllowed())
+                {
+                    g_passMatrices = candidateMatrices;
+                    g_passMatricesGeneration =
+                        worldvbo::ContextGeneration();
+                    g_passMatricesValid = true;
+                }
                 commitRunMatrices = true;
             }
-            commitLastEntity = true;
         }
     }
 
@@ -5412,8 +5512,7 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
         g_deferredRunMatrices = candidateMatrices;
         g_deferredRunMatricesValid = true;
     }
-    if (commitLastEntity)
-        g_deferredLastEntity = state.entity;
+    g_deferredLastEntity = state.entity;
 
     // Gold-visible accounting/current immediate state still happens at the
     // original DrawPoints point. Only the GPU submission is deferred.
@@ -5428,6 +5527,8 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     const PreparedDirectMesh& last =
         g_preparedMeshes.back();
     BindGoldTextureSafe(last.material.texture->glId);
+    g_deferredEntryTexture = last.material.texture->glId;
+    g_deferredEntryTextureValid = true;
     (void)RestoreFinalImmediateState(
         state, cache, *last.mesh, last.material);
 
@@ -5435,14 +5536,201 @@ bool RecordDeferredDirectDraw(const DirectGlobals& state,
     return true;
 }
 
-bool FlushDeferredSolidCommands()
+// Orders the accepted packets and assigns their UBO offsets. Without
+// instancing the order is the recording order and every packet owns one
+// aligned 8 KB slot, exactly as before. With instancing, packets that share
+// (retained cache, submodel, mirror/renderer state, per-mesh range, texture
+// and material) are bucketed and each bucket is split into chunks that fit
+// the instanced block. Chunk members are packed at their palette stride from
+// one aligned start, which never needs more space than the per-packet slots
+// reserved by DeferredCapacityAvailable.
+bool BuildDeferredDrawPlan(bool instancingReady,
+                           std::size_t& dataEnd)
 {
-    if (g_deferredCommands.empty())
+    dataEnd = g_uniformBufferOffset;
+    g_deferredOrder.clear();
+    g_deferredBucketHeads.clear();
+    g_deferredGroups.clear();
+    const std::size_t alignment =
+        static_cast<std::size_t>(g_uniformBufferAlignment);
+    if (alignment == 0)
+        return false;
+    const std::size_t commandCount = g_deferredCommands.size();
+
+    try
     {
-        g_deferredRunMatricesValid = false;
-        g_deferredLastEntity = nullptr;
-        return true;
+        g_deferredOrder.reserve(commandCount);
+        g_deferredGroups.reserve(commandCount);
+        if (!instancingReady)
+        {
+            for (std::size_t i = 0; i < commandCount; ++i)
+                g_deferredOrder.push_back(i);
+        }
+        else
+        {
+            // Counting sort by first-seen bucket. Buckets keep their first
+            // recording position, members keep their recording order. Every
+            // packet here is opaque, depth-written and blend-free, so only
+            // equal-depth ties between different entities could observe the
+            // changed submission order.
+            for (std::size_t i = 0; i < commandCount; ++i)
+            {
+                DeferredStudioCommand& command = g_deferredCommands[i];
+                std::size_t bucket = g_deferredBucketHeads.size();
+                for (std::size_t b = 0;
+                     b < g_deferredBucketHeads.size(); ++b)
+                {
+                    if (DeferredCommandsShareInstanceKey(
+                            g_deferredCommands[g_deferredBucketHeads[b]],
+                            command))
+                    {
+                        bucket = b;
+                        break;
+                    }
+                }
+                if (bucket == g_deferredBucketHeads.size())
+                    g_deferredBucketHeads.push_back(i);
+                command.bucket = bucket;
+            }
+            const std::size_t bucketCount = g_deferredBucketHeads.size();
+            // Reuse the heads vector as per-bucket write cursors.
+            std::vector<std::size_t>& cursor = g_deferredBucketHeads;
+            for (std::size_t b = 0; b < bucketCount; ++b)
+                cursor[b] = 0;
+            for (const DeferredStudioCommand& command : g_deferredCommands)
+                ++cursor[command.bucket];
+            std::size_t running = 0;
+            for (std::size_t b = 0; b < bucketCount; ++b)
+            {
+                const std::size_t count = cursor[b];
+                cursor[b] = running;
+                running += count;
+            }
+            g_deferredOrder.resize(commandCount);
+            for (std::size_t i = 0; i < commandCount; ++i)
+                g_deferredOrder[cursor[g_deferredCommands[i].bucket]++] = i;
+        }
     }
+    catch (...)
+    {
+        return false;
+    }
+
+    std::size_t next = g_uniformBufferOffset;
+    auto placeSingle = [&](std::size_t orderIndex,
+                           std::size_t records) -> bool
+    {
+        const std::size_t aligned = AlignUp(next, alignment);
+        if (aligned > kUniformBufferBytes ||
+            kBoneBlockBytes > kUniformBufferBytes - aligned)
+            return false;
+        g_deferredCommands[g_deferredOrder[orderIndex]].uniformOffset =
+            aligned;
+        DeferredDrawGroup group{};
+        group.orderFirst = orderIndex;
+        group.count = 1;
+        group.uniformOffset = aligned;
+        group.recordsPerInstance = records;
+        g_deferredGroups.push_back(group);
+        next = aligned + kBoneBlockBytes;
+        return true;
+    };
+
+    std::size_t orderIndex = 0;
+    while (orderIndex < commandCount)
+    {
+        const DeferredStudioCommand& head =
+            g_deferredCommands[g_deferredOrder[orderIndex]];
+        if (!head.cache || !head.cache->vertexArray ||
+            head.meshCount == 0 ||
+            head.meshFirst > g_deferredMeshes.size() ||
+            head.meshCount > g_deferredMeshes.size() - head.meshFirst ||
+            head.boneFloatFirst > g_deferredBoneFloats.size() ||
+            head.boneFloatCount >
+                g_deferredBoneFloats.size() - head.boneFloatFirst ||
+            head.boneFloatCount == 0 ||
+            head.boneFloatCount % kBoneRecordFloats != 0 ||
+            head.boneFloatCount * sizeof(float) > kBoneBlockBytes)
+            return false;
+        const std::size_t records =
+            head.boneFloatCount / kBoneRecordFloats;
+
+        std::size_t runEnd = orderIndex + 1;
+        if (instancingReady)
+        {
+            while (runEnd < commandCount &&
+                   g_deferredCommands[g_deferredOrder[runEnd]].bucket ==
+                       head.bucket)
+                ++runEnd;
+        }
+
+        std::size_t maxInstances = 1;
+        if (instancingReady && g_instancedBlockBytes > 0)
+        {
+            maxInstances =
+                g_instancedBlockBytes / (records * kBoneRecordBytes);
+            if (maxInstances > g_instancedCapacity)
+                maxInstances = g_instancedCapacity;
+        }
+
+        while (orderIndex < runEnd)
+        {
+            std::size_t count = runEnd - orderIndex;
+            if (count > maxInstances)
+                count = maxInstances;
+            if (count >= 2)
+            {
+                const std::size_t aligned = AlignUp(next, alignment);
+                const std::size_t stride = records * kBoneRecordBytes;
+                if (aligned <= kUniformBufferBytes &&
+                    g_instancedBlockBytes <=
+                        kUniformBufferBytes - aligned)
+                {
+                    for (std::size_t member = 0; member < count; ++member)
+                    {
+                        DeferredStudioCommand& command =
+                            g_deferredCommands[
+                                g_deferredOrder[orderIndex + member]];
+                        if (command.boneFloatFirst >
+                                g_deferredBoneFloats.size() ||
+                            command.boneFloatCount >
+                                g_deferredBoneFloats.size() -
+                                    command.boneFloatFirst)
+                            return false;
+                        command.uniformOffset = aligned + member * stride;
+                    }
+                    DeferredDrawGroup group{};
+                    group.orderFirst = orderIndex;
+                    group.count = count;
+                    group.uniformOffset = aligned;
+                    group.recordsPerInstance = records;
+                    g_deferredGroups.push_back(group);
+                    next = aligned + count * stride;
+                    orderIndex += count;
+                    continue;
+                }
+                // The bound instanced range would run past the ring buffer,
+                // replay this chunk through ordinary per-packet slots.
+            }
+            for (std::size_t member = 0; member < count; ++member)
+            {
+                const DeferredStudioCommand& command =
+                    g_deferredCommands[g_deferredOrder[orderIndex]];
+                if (command.boneFloatFirst > g_deferredBoneFloats.size() ||
+                    command.boneFloatCount >
+                        g_deferredBoneFloats.size() - command.boneFloatFirst ||
+                    !placeSingle(orderIndex, records))
+                    return false;
+                ++orderIndex;
+            }
+        }
+    }
+    dataEnd = next;
+    return true;
+}
+
+bool FlushDeferredSolidCommandsImpl()
+{
     if (g_deferredFlushInProgress)
         return false;
     if (!g_useUniformBuffer ||
@@ -5454,19 +5742,12 @@ bool FlushDeferredSolidCommands()
         !g_bindVertexArray ||
         !g_bindBuffer ||
         !g_bindBufferRange ||
-        !g_bindBufferBase ||
         !g_bufferSubData ||
         !g_getIntegerv ||
-        !g_getIntegeriV ||
-        !g_getInteger64iV ||
-        !g_isEnabled ||
         !g_activeTexture ||
         !g_texEnvi ||
         !g_getTexEnviv ||
         !g_shadeModel ||
-        !g_cullFace ||
-        !g_enable ||
-        !g_disable ||
         !g_goldBind ||
         !g_drawElements)
         return false;
@@ -5478,80 +5759,49 @@ bool FlushDeferredSolidCommands()
     if (!frame.buffer)
         return false;
 
-    IndexedUboBinding previousIndexedUniform{};
-    bool previousIndexedWasOurs = false;
-    if (!ReadReservedUniformBinding(
-            previousIndexedUniform,
-            previousIndexedWasOurs))
-        return false;
-
-    // Preflight every fixed-size UBO range before Gold has any chance to lose
-    // an accepted deferred packet. RecordDeferredDirectDraw already reserves
-    // capacity, but this protects against state drift and keeps the staging
-    // loop free of predictable early exits.
+    // Preflight every UBO range before Gold has any chance to lose an
+    // accepted deferred packet. RecordDeferredDirectDraw already reserves
+    // capacity, this protects against state drift and keeps the staging loop
+    // free of predictable early exits.
     std::size_t nextUniformOffset = g_uniformBufferOffset;
-    const std::size_t alignment =
-        static_cast<std::size_t>(g_uniformBufferAlignment);
-    if (alignment == 0)
+    if (!BuildDeferredDrawPlan(
+            EnsureInstancedProgram(), nextUniformOffset) &&
+        !BuildDeferredDrawPlan(false, nextUniformOffset))
         return false;
-    for (DeferredStudioCommand& command : g_deferredCommands)
-    {
-        if (!command.cache || !command.cache->vertexArray ||
-            command.meshCount == 0 ||
-            command.meshFirst > g_deferredMeshes.size() ||
-            command.meshCount > g_deferredMeshes.size() - command.meshFirst ||
-            command.boneFloatFirst > g_deferredBoneFloats.size() ||
-            command.boneFloatCount >
-                g_deferredBoneFloats.size() - command.boneFloatFirst)
-            return false;
-        const std::size_t aligned = AlignUp(nextUniformOffset, alignment);
-        if (aligned > kUniformBufferBytes ||
-            kBoneBlockBytes > kUniformBufferBytes - aligned)
-            return false;
-        command.uniformOffset = aligned;
-        nextUniformOffset = aligned + kBoneBlockBytes;
-    }
-    const bool instancingReady = EnsureInstancedProgram();
+    if (g_deferredGroups.empty())
+        return false;
 
+    // Only state this flush changes and whose previous value is not already
+    // known is read back here:
+    // - ARRAY_BUFFER is never bound by the flush, ELEMENT_ARRAY_BUFFER is VAO
+    //   state and returns with the previous VAO.
+    // - Every recorded packet uses Gold's ordinary renderer type, which has no
+    //   cull transition, so cull face/mode are never touched.
+    // - The reserved indexed UBO point and the generic UBO target are
+    //   module-owned (see g_lastUniformBlock*).
+    // - The active TMU comes from Gold's own shadow, and TMU0 ends bound to
+    //   the texture the last recorded DrawPoints left bound.
+    // Program, VAO, TMU0 env mode and shade model can be changed by Gold or
+    // foreign code between packets and stay queried, once per flush.
     int previousProgram = 0;
     int previousVao = 0;
-    int previousArrayBuffer = 0;
-    int previousElementBuffer = 0;
-    int previousUniformBuffer = 0;
     int previousActiveTexture =
         static_cast<int>(GL_TEXTURE0);
-    int previousTexture = 0;
-    int previousCullFaceMode =
-        static_cast<int>(GL_FRONT);
     int previousTexEnvMode =
         static_cast<int>(GL_REPLACE);
     int previousShadeModel =
         static_cast<int>(GL_FLAT);
-    bool previousCullEnabled = true;
+    if (!ReadActiveTexture(previousActiveTexture))
+        return false;
     __try
     {
         g_getIntegerv(
             GL_CURRENT_PROGRAM, &previousProgram);
         g_getIntegerv(
             GL_VERTEX_ARRAY_BINDING, &previousVao);
-        g_getIntegerv(
-            GL_ARRAY_BUFFER_BINDING,
-            &previousArrayBuffer);
-        g_getIntegerv(
-            GL_ELEMENT_ARRAY_BUFFER_BINDING,
-            &previousElementBuffer);
-        g_getIntegerv(
-            GL_UNIFORM_BUFFER_BINDING,
-            &previousUniformBuffer);
-        g_getIntegerv(
-            GL_ACTIVE_TEXTURE,
-            &previousActiveTexture);
         if (previousActiveTexture !=
             static_cast<int>(GL_TEXTURE0))
             g_activeTexture(GL_TEXTURE0);
-        g_getIntegerv(
-            GL_TEXTURE_BINDING_2D,
-            &previousTexture);
         g_getTexEnviv(
             GL_TEXTURE_ENV,
             GL_TEXTURE_ENV_MODE,
@@ -5559,11 +5809,6 @@ bool FlushDeferredSolidCommands()
         g_getIntegerv(
             GL_SHADE_MODEL,
             &previousShadeModel);
-        g_getIntegerv(
-            GL_CULL_FACE_MODE,
-            &previousCullFaceMode);
-        previousCullEnabled =
-            g_isEnabled(GL_CULL_FACE) != 0;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -5577,62 +5822,67 @@ bool FlushDeferredSolidCommands()
     }
 
     bool submitted = false;
+    bool rangeBound = false;
+    std::size_t boundRangeOffset = 0;
+    std::size_t boundRangeSize = 0;
     g_deferredFlushInProgress = true;
     __try
     {
         // csgl3-style ordering: stage every constant block first. No draw is
         // interleaved with a buffer write. Prefer one mapped range for the
         // whole deferred run, this turns N driver uploads into one map/unmap
-        // while keeping the same fixed UBO offsets and draw ordering.
+        // while keeping fixed UBO offsets for every planned draw.
         g_bindBuffer(
             GL_UNIFORM_BUFFER, frame.buffer);
         bool batchUploaded = false;
+        const std::size_t mapStart =
+            g_deferredGroups.front().uniformOffset;
+        const std::size_t mapEnd = nextUniformOffset;
         if (g_mapBufferRange && g_unmapBuffer &&
-            !g_deferredCommands.empty())
+            mapEnd >= mapStart &&
+            mapEnd <= kUniformBufferBytes)
         {
-            const std::size_t mapStart =
-                g_deferredCommands.front().uniformOffset;
-            const std::size_t mapEnd = nextUniformOffset;
-            if (mapEnd >= mapStart &&
-                mapEnd <= kUniformBufferBytes)
+            const std::size_t mapBytes = mapEnd - mapStart;
+            void* mapped = g_mapBufferRange(
+                GL_UNIFORM_BUFFER,
+                static_cast<std::ptrdiff_t>(mapStart),
+                static_cast<std::ptrdiff_t>(mapBytes),
+                // The buffer is orphaned once per frame and ranges are
+                // never rewritten within a frame, so no GPU sync is needed.
+                GL_MAP_WRITE_BIT |
+                    GL_MAP_INVALIDATE_RANGE_BIT |
+                    GL_MAP_UNSYNCHRONIZED_BIT);
+            if (mapped)
             {
-                const std::size_t mapBytes = mapEnd - mapStart;
-                void* mapped = g_mapBufferRange(
-                    GL_UNIFORM_BUFFER,
-                    static_cast<std::ptrdiff_t>(mapStart),
-                    static_cast<std::ptrdiff_t>(mapBytes),
-                    // The buffer is orphaned once per frame and ranges are
-                    // never rewritten within a frame, so no GPU sync is needed.
-                    GL_MAP_WRITE_BIT |
-                        GL_MAP_INVALIDATE_RANGE_BIT |
-                        GL_MAP_UNSYNCHRONIZED_BIT);
-                if (mapped)
+                bool copyOk = true;
+                for (const DeferredStudioCommand& command :
+                     g_deferredCommands)
                 {
-                    bool copyOk = true;
-                    for (const DeferredStudioCommand& command :
-                         g_deferredCommands)
+                    const std::size_t bytes =
+                        command.boneFloatCount *
+                        sizeof(float);
+                    if (command.uniformOffset < mapStart)
                     {
-                        const std::size_t bytes =
-                            command.boneFloatCount *
-                            sizeof(float);
-                        const std::size_t relative =
-                            command.uniformOffset - mapStart;
-                        if (relative > mapBytes ||
-                            bytes > mapBytes - relative)
-                        {
-                            copyOk = false;
-                            break;
-                        }
-                        std::memcpy(
-                            static_cast<std::uint8_t*>(mapped) + relative,
-                            g_deferredBoneFloats.data() +
-                                command.boneFloatFirst,
-                            bytes);
+                        copyOk = false;
+                        break;
                     }
-                    const bool unmapped =
-                        g_unmapBuffer(GL_UNIFORM_BUFFER) != 0;
-                    batchUploaded = copyOk && unmapped;
+                    const std::size_t relative =
+                        command.uniformOffset - mapStart;
+                    if (relative > mapBytes ||
+                        bytes > mapBytes - relative)
+                    {
+                        copyOk = false;
+                        break;
+                    }
+                    std::memcpy(
+                        static_cast<std::uint8_t*>(mapped) + relative,
+                        g_deferredBoneFloats.data() +
+                            command.boneFloatFirst,
+                        bytes);
                 }
+                const bool unmapped =
+                    g_unmapBuffer(GL_UNIFORM_BUFFER) != 0;
+                batchUploaded = copyOk && unmapped;
             }
         }
         if (!batchUploaded)
@@ -5689,23 +5939,18 @@ bool FlushDeferredSolidCommands()
         bool colorBlendValid = false;
         bool paramsValid = false;
         bool instancedMatricesReady = false;
-        for (std::size_t commandIndex = 0;
-             commandIndex < g_deferredCommands.size();)
+        float instancedLayout[4]{-1.0f, 0.0f, 0.0f, 0.0f};
+        float instanceParams[kInstanceCap][4]{};
+        float instanceColors[kInstanceCap][4]{};
+        for (const DeferredDrawGroup& group : g_deferredGroups)
         {
             const DeferredStudioCommand& command =
-                g_deferredCommands[commandIndex];
+                g_deferredCommands[g_deferredOrder[group.orderFirst]];
 
-            if (instancingReady &&
-                commandIndex + 1u < g_deferredCommands.size() &&
-                DeferredCommandsCanInstancePair(
-                    command,
-                    g_deferredCommands[commandIndex + 1u]))
+            if (group.count >= 2)
             {
-                const DeferredStudioCommand& second =
-                    g_deferredCommands[commandIndex + 1u];
-                const DeferredMeshDraw& draw =
-                    g_deferredMeshes[command.meshFirst];
-
+                const int instanceCount =
+                    static_cast<int>(group.count);
                 if (activeProgram != g_instancedProgram)
                 {
                     g_useProgram(g_instancedProgram);
@@ -5739,55 +5984,41 @@ bool FlushDeferredSolidCommands()
                         g_deferredRunMatrices.texture);
                     instancedMatricesReady = true;
                 }
+                const float records =
+                    static_cast<float>(group.recordsPerInstance);
+                if (instancedLayout[0] != records)
+                {
+                    instancedLayout[0] = records;
+                    g_uniform4fv(
+                        g_instancedLayoutLocation, 1,
+                        instancedLayout);
+                }
 
                 g_bindBufferRange(
                     GL_UNIFORM_BUFFER,
                     g_boneBlockBinding,
                     frame.buffer,
                     static_cast<std::ptrdiff_t>(
-                        command.uniformOffset),
+                        group.uniformOffset),
                     static_cast<std::ptrdiff_t>(
-                        kBoneBlockBytes * 2u));
+                        g_instancedBlockBytes));
+                rangeBound = true;
+                boundRangeOffset = group.uniformOffset;
+                boundRangeSize = g_instancedBlockBytes;
 
-                float instanceParams[kMaxStudioInstances][4]{};
-                float instanceColors[kMaxStudioInstances][4]{};
-                const DeferredStudioCommand* pair[2] = {
-                    &command, &second
-                };
-                for (unsigned instance = 0;
-                     instance < kMaxStudioInstances;
-                     ++instance)
+                for (std::size_t member = 0;
+                     member < group.count; ++member)
                 {
-                    const DeferredStudioCommand& item =
-                        *pair[instance];
-                    const DeferredMeshDraw& itemDraw =
-                        g_deferredMeshes[item.meshFirst];
-                    instanceParams[instance][0] =
-                        (itemDraw.flags & 1u) != 0u
-                            ? -itemDraw.sScale
-                            : itemDraw.sScale;
-                    instanceParams[instance][1] =
-                        itemDraw.tScale;
-                    instanceParams[instance][2] =
-                        (itemDraw.flags & 1u) != 0u
-                            ? itemDraw.flatLight
-                            : item.ambient;
-                    instanceParams[instance][3] =
-                        (itemDraw.flags & 1u) != 0u
-                            ? 0.0f
-                            : item.shade;
                     std::memcpy(
-                        instanceColors[instance],
-                        item.colorBlend,
-                        sizeof(instanceColors[instance]));
+                        instanceColors[member],
+                        g_deferredCommands[
+                            g_deferredOrder[
+                                group.orderFirst + member]].colorBlend,
+                        sizeof(instanceColors[member]));
                 }
                 g_uniform4fv(
-                    g_instancedParamsLocation,
-                    static_cast<int>(kMaxStudioInstances),
-                    &instanceParams[0][0]);
-                g_uniform4fv(
                     g_instancedColorBlendLocation,
-                    static_cast<int>(kMaxStudioInstances),
+                    instanceCount,
                     &instanceColors[0][0]);
 
                 if (boundVao != command.cache->vertexArray)
@@ -5796,24 +6027,59 @@ bool FlushDeferredSolidCommands()
                         command.cache->vertexArray);
                     boundVao = command.cache->vertexArray;
                 }
-                if (boundTexture != draw.glId)
+
+                for (std::size_t meshIndex = 0;
+                     meshIndex < command.meshCount;
+                     ++meshIndex)
                 {
-                    g_goldBind(0, draw.glId);
-                    boundTexture = draw.glId;
+                    const DeferredMeshDraw& draw =
+                        g_deferredMeshes[
+                            command.meshFirst + meshIndex];
+                    if (boundTexture != draw.glId)
+                    {
+                        g_goldBind(0, draw.glId);
+                        boundTexture = draw.glId;
+                    }
+                    // Texture scale and FLATSHADE are bucket-wide. Lighting
+                    // (ambient/shade or the sampled flat light) stays per
+                    // entity, exactly as the single-packet path encodes it.
+                    for (std::size_t member = 0;
+                         member < group.count; ++member)
+                    {
+                        const DeferredStudioCommand& item =
+                            g_deferredCommands[
+                                g_deferredOrder[
+                                    group.orderFirst + member]];
+                        const DeferredMeshDraw& itemDraw =
+                            g_deferredMeshes[
+                                item.meshFirst + meshIndex];
+                        const bool flat = (itemDraw.flags & 1u) != 0u;
+                        instanceParams[member][0] =
+                            flat ? -itemDraw.sScale : itemDraw.sScale;
+                        instanceParams[member][1] = itemDraw.tScale;
+                        instanceParams[member][2] =
+                            flat ? itemDraw.flatLight : item.ambient;
+                        instanceParams[member][3] =
+                            flat ? 0.0f : item.shade;
+                    }
+                    g_uniform4fv(
+                        g_instancedParamsLocation,
+                        instanceCount,
+                        &instanceParams[0][0]);
+                    g_drawElementsInstanced(
+                        GL_TRIANGLES,
+                        static_cast<int>(draw.indexCount),
+                        RetainedIndexType(*command.cache),
+                        reinterpret_cast<const void*>(
+                            static_cast<std::uintptr_t>(
+                                draw.firstIndex) *
+                            RetainedIndexBytes(*command.cache)),
+                        instanceCount);
+                    ++g_instancedDrawCalls;
                 }
-                g_drawElementsInstanced(
-                    GL_TRIANGLES,
-                    static_cast<int>(draw.indexCount),
-                    RetainedIndexType(*command.cache),
-                    reinterpret_cast<const void*>(
-                        static_cast<std::uintptr_t>(
-                            draw.firstIndex) *
-                        RetainedIndexBytes(*command.cache)),
-                    static_cast<int>(kMaxStudioInstances));
-                ++g_instancedDrawCalls;
-                g_instancedEntities += kMaxStudioInstances;
-                ++g_instancedSavedDraws;
-                commandIndex += kMaxStudioInstances;
+                g_instancedEntities += group.count;
+                g_instancedSavedDraws +=
+                    (group.count - 1u) * command.meshCount;
                 continue;
             }
 
@@ -5830,6 +6096,9 @@ bool FlushDeferredSolidCommands()
                     command.uniformOffset),
                 static_cast<std::ptrdiff_t>(
                     kBoneBlockBytes));
+            rangeBound = true;
+            boundRangeOffset = command.uniformOffset;
+            boundRangeSize = kBoneBlockBytes;
             if (!colorBlendValid ||
                 std::memcmp(lastColorBlend, command.colorBlend,
                             sizeof(lastColorBlend)) != 0)
@@ -5853,17 +6122,6 @@ bool FlushDeferredSolidCommands()
                     command.cache->vertexArray);
                 boundVao =
                     command.cache->vertexArray;
-            }
-
-            if (command.rendererType != 1)
-            {
-                if (command.mirror)
-                    g_disable(GL_CULL_FACE);
-                else
-                {
-                    g_enable(GL_CULL_FACE);
-                    g_cullFace(GL_FRONT);
-                }
             }
 
             for (std::size_t meshIndex = 0;
@@ -5916,10 +6174,6 @@ bool FlushDeferredSolidCommands()
                             draw.firstIndex) *
                         RetainedIndexBytes(*command.cache)));
             }
-            if (command.rendererType != 1 &&
-                command.mirror)
-                g_enable(GL_CULL_FACE);
-            ++commandIndex;
         }
         submitted = true;
     }
@@ -5928,35 +6182,21 @@ bool FlushDeferredSolidCommands()
         submitted = false;
     }
 
-    bool indexedRestored = false;
     __try
     {
-        indexedRestored = RestoreIndexedUboBinding(
-            g_boneBlockBinding,
-            previousIndexedUniform);
         g_bindBuffer(
             GL_UNIFORM_BUFFER,
             static_cast<unsigned>(
-                previousUniformBuffer));
+                g_genericUniformRestore));
         g_useProgram(
             static_cast<unsigned>(
                 previousProgram));
         g_bindVertexArray(
             static_cast<unsigned>(
                 previousVao));
-        g_bindBuffer(
-            GL_ARRAY_BUFFER,
-            static_cast<unsigned>(
-                previousArrayBuffer));
-        g_bindBuffer(
-            GL_ELEMENT_ARRAY_BUFFER,
-            static_cast<unsigned>(
-                previousElementBuffer));
         g_activeTexture(GL_TEXTURE0);
-        g_goldBind(
-            0,
-            static_cast<unsigned>(
-                previousTexture));
+        if (g_deferredEntryTextureValid)
+            g_goldBind(0, g_deferredEntryTexture);
         g_texEnvi(
             GL_TEXTURE_ENV,
             GL_TEXTURE_ENV_MODE,
@@ -5968,35 +6208,12 @@ bool FlushDeferredSolidCommands()
             g_activeTexture(
                 static_cast<unsigned>(
                     previousActiveTexture));
-        g_cullFace(
-            static_cast<unsigned>(
-                previousCullFaceMode));
-        if (previousCullEnabled)
-            g_enable(GL_CULL_FACE);
-        else
-            g_disable(GL_CULL_FACE);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-    if (!indexedRestored)
-    {
-        g_lastUniformBlockBuffer = 0;
-        g_lastUniformBlockOffset = 0;
-        g_lastUniformBlockSize = 0;
-    }
-    else if (!previousIndexedWasOurs)
-    {
-        ClearUniformBindingOwnership();
-    }
-    else
-    {
-        g_lastUniformBlockBuffer =
-            previousIndexedUniform.buffer;
-        g_lastUniformBlockOffset =
-            static_cast<std::size_t>(previousIndexedUniform.start);
-        g_lastUniformBlockSize =
-            static_cast<std::size_t>(previousIndexedUniform.size);
-    }
+    if (rangeBound)
+        NoteOwnedUniformRange(
+            frame.buffer, boundRangeOffset, boundRangeSize);
     g_deferredFlushInProgress = false;
 
     if (submitted)
@@ -6008,15 +6225,82 @@ bool FlushDeferredSolidCommands()
             static_cast<unsigned>(
                 g_deferredCommands.size()));
 
+    if (prof::Active())
+    {
+        g_flushProfile.groups += g_deferredGroups.size();
+        for (const DeferredDrawGroup& group : g_deferredGroups)
+        {
+            if (group.count >= 2)
+                ++g_flushProfile.instancedGroups;
+        }
+    }
+
     g_deferredCommands.clear();
     g_deferredMeshes.clear();
     g_deferredBoneFloats.clear();
+    g_deferredOrder.clear();
+    g_deferredGroups.clear();
     g_deferredRunMatricesValid = false;
     g_deferredLastEntity = nullptr;
+    g_deferredEntryTextureValid = false;
     g_entityUniformKeyValid = false;
     g_colorBlendUniformValid = false;
     g_paramsUniformValid = false;
     return submitted;
+}
+
+bool CurrentEntityIsPlayer()
+{
+    if (!g_hwBase)
+        return false;
+    __try
+    {
+        const std::uint8_t* const entity =
+            *reinterpret_cast<std::uint8_t* const*>(
+                g_hwBase + kCurrentEntityRva);
+        return entity &&
+               *reinterpret_cast<const int*>(entity + 4) != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Flushes from inside a Studio draw (retained kernel, client shadow provider,
+// glow-shell base pass) of a player already run inside studio.cpp's timed
+// StudioDrawPlayer. Every other flush is otherwise invisible to the Studio
+// phase and is charged here while profiling.
+bool FlushDeferredSolidCommands(FlushSite site)
+{
+    if (g_deferredCommands.empty())
+    {
+        g_deferredRunMatricesValid = false;
+        g_deferredLastEntity = nullptr;
+        g_deferredEntryTextureValid = false;
+        return true;
+    }
+    if (!prof::Active())
+        return FlushDeferredSolidCommandsImpl();
+
+    const std::uint64_t records = g_deferredCommands.size();
+    const long long start = prof::Now();
+    const bool flushed = FlushDeferredSolidCommandsImpl();
+    const long long elapsed = prof::Now() - start;
+    ++g_flushProfile.flushes;
+    g_flushProfile.records += records;
+    if (records > g_flushProfile.maxRecords)
+        g_flushProfile.maxRecords = records;
+    g_flushProfile.ticks += elapsed;
+    const bool alreadyTimed =
+        site == FlushSite::InsideStudioDraw &&
+        CurrentEntityIsPlayer();
+    if (!alreadyTimed)
+    {
+        prof::AddStudio(elapsed);
+        g_flushProfile.chargedTicks += elapsed;
+    }
+    return flushed;
 }
 
 bool TryDirectDraw(void* wrapperCaller)
@@ -6125,7 +6409,7 @@ bool TryDirectDraw(void* wrapperCaller)
         if (nonPlayerPhase1)
         {
             if (!g_deferredCommands.empty())
-                (void)FlushDeferredSolidCommands();
+                (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
             return DirectFallback(DirectFallbackReason::Submodel);
         }
         const StudioModelRaw* blank = submodel.source;
@@ -6248,7 +6532,7 @@ bool TryDirectDraw(void* wrapperCaller)
     // A pending recorded player must become visible before any subsequent
     // immediate/stock draw. This is the central ordering barrier.
     if (!g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands();
+        (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
 
     // Phase-1 non-player coverage is intentionally deferred-only.  If the
     // recorder cannot represent this exact DrawModel case, fail open to Gold
@@ -6317,7 +6601,7 @@ bool __cdecl DirectKernelDispatch(void* wrapperCaller)
             ++g_forcedProgramRestores;
     }
     if (!direct && !g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands();
+        (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
     if (collectTiming)
     {
         const long long elapsed = prof::Now() - attemptStart;
@@ -6481,13 +6765,28 @@ bool PatchRelativeCallTarget(std::uint8_t* callsite,
                              void* expected,
                              void* replacement);
 
+// Brush, sprite and client shadow draws are the only non-Studio GL work Gold
+// interleaves with Studio draws inside the solid entity pass. They flush the
+// deferred run and end the current matrix / client-array snapshots.
+void __cdecl SolidBarrierFlush()
+{
+    (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+    InvalidatePassSnapshots();
+}
+
+void __cdecl ShadowBarrierFlush()
+{
+    (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
+    InvalidatePassSnapshots();
+}
+
 __declspec(naked) void DrawBrushModelBarrierCall()
 {
     __asm
     {
         pushfd
         pushad
-        call FlushDeferredSolidCommands
+        call SolidBarrierFlush
         call spritevbo::Flush
         call worldvbo::BeginBrushScope
         popad
@@ -6504,7 +6803,8 @@ __declspec(naked) void DrawBrushModelBarrierCall()
 
 bool __cdecl TryBeginSolidSpriteCapture()
 {
-    if (!FlushDeferredSolidCommands())
+    InvalidatePassSnapshots();
+    if (!FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw))
     {
         spritevbo::Flush();
         return false;
@@ -6558,7 +6858,7 @@ __declspec(naked) void ClientStudioShadowBarrierCall()
         movups [esp + 70h], xmm7
         pushfd
         pushad
-        call FlushDeferredSolidCommands
+        call ShadowBarrierFlush
         popad
         popfd
         movups xmm0, [esp + 00h]
@@ -6782,6 +7082,46 @@ bool SetDirectKernelHook(bool enabled)
     g_innerCallHooked = false;
     return CurrentRelativeCallTarget(callsite) == stock;
 }
+void LogFlushProfile()
+{
+    FlushProfileStats& stats = g_flushProfile;
+    if (stats.frames == 0)
+        return;
+    LARGE_INTEGER frequency{};
+    const double ticksToMs =
+        QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0
+            ? 1000.0 / static_cast<double>(frequency.QuadPart)
+            : 0.0;
+    const double frames = static_cast<double>(stats.frames);
+    rendererlog::Line(
+        "studio renderer: deferred flushes/frame=%.2f records/flush=%.2f "
+        "maxRecords=%llu groups/flush=%.2f instGroups/frame=%.2f "
+        "flushMs/frame=%.4f chargedMs/frame=%.4f matrixVerify=%llu "
+        "matrixMismatch=%llu frames=%llu",
+        static_cast<double>(stats.flushes) / frames,
+        stats.flushes
+            ? static_cast<double>(stats.records) /
+                  static_cast<double>(stats.flushes)
+            : 0.0,
+        static_cast<unsigned long long>(stats.maxRecords),
+        stats.flushes
+            ? static_cast<double>(stats.groups) /
+                  static_cast<double>(stats.flushes)
+            : 0.0,
+        static_cast<double>(stats.instancedGroups) / frames,
+        static_cast<double>(stats.ticks) * ticksToMs / frames,
+        static_cast<double>(stats.chargedTicks) * ticksToMs / frames,
+        static_cast<unsigned long long>(stats.matrixVerifies),
+        static_cast<unsigned long long>(stats.matrixMismatches),
+        static_cast<unsigned long long>(stats.frames));
+    stats = {};
+}
+
+void EndPassSnapshotScope()
+{
+    InvalidatePassSnapshots();
+    studio_drawbatch::SetClientArrayProofScope(false);
+}
 } // namespace
 
 bool BeginDrawModelBatchScope(int flags, void* caller)
@@ -6873,6 +7213,24 @@ void UpdateFrame()
 {
     if (!g_mode || !g_hwBase)
         return;
+    if (g_solidEntityPassDepth <= 0)
+        EndPassSnapshotScope();
+    else
+        InvalidatePassSnapshots();
+    if (prof::Active())
+    {
+        ++g_flushProfile.frames;
+        if (g_flushProfile.frames >= 600u)
+        {
+            if (rendererlog::StatsEnabled())
+                LogFlushProfile();
+            g_flushProfile = {};
+        }
+    }
+    else if (g_flushProfile.frames != 0)
+    {
+        g_flushProfile = {};
+    }
     const int mode = ReadMode();
     if (mode == 1)
     {
@@ -6911,31 +7269,38 @@ void BeginSolidEntityPass()
     spritevbo::BeginSolidPass();
     if (ReadMode() != 1)
         return;
-    if (g_solidEntityPassDepth == 0 &&
-        !g_deferredCommands.empty())
-        (void)FlushDeferredSolidCommands();
+    // A (nested) pass may run under different view matrices, so a pending
+    // run is made visible and every snapshot restarts at each pass boundary.
+    if (!g_deferredCommands.empty())
+        (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
+    InvalidatePassSnapshots();
     ++g_solidEntityPassDepth;
+    studio_drawbatch::SetClientArrayProofScope(PassSnapshotsAllowed());
 }
 
 void EndSolidEntityPass()
 {
     if (g_solidEntityPassDepth > 0)
     {
-        if (g_solidEntityPassDepth == 1)
-            (void)FlushDeferredSolidCommands();
+        (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
         --g_solidEntityPassDepth;
+        if (g_solidEntityPassDepth == 0)
+            EndPassSnapshotScope();
+        else
+            InvalidatePassSnapshots();
     }
     spritevbo::EndSolidPass();
 }
 
 void FlushDeferredStudioCommands()
 {
-    (void)FlushDeferredSolidCommands();
+    // Glow-shell base pass boundary, reached from inside a Studio draw.
+    (void)FlushDeferredSolidCommands(FlushSite::InsideStudioDraw);
 }
 
 void FlushSolidEntityCommands()
 {
-    (void)FlushDeferredSolidCommands();
+    (void)FlushDeferredSolidCommands(FlushSite::OutsideStudioDraw);
     spritevbo::Flush();
 }
 } // namespace studio_renderer

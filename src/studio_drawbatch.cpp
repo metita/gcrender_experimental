@@ -560,6 +560,25 @@ void* g_retainedDirectBridgeCaller = nullptr;
 int g_previousArrayBuffer = 0;
 int g_previousElementArrayBuffer = 0;
 int g_previousClientTexture = static_cast<int>(GL_TEXTURE0);
+// Client-array baseline proven by a cold array-scope entry. Inside the solid
+// entity pass only Studio code runs between two Studio draws until the next
+// brush/sprite/shadow barrier, and every Studio array user restores this
+// exact state (push/pop client attrib, VAO restore, saved buffer bindings).
+// studio_renderer enables reuse only for that window and clears it at every
+// barrier, so the proof does not need the per-draw IsEnabled/Get queries.
+struct ClientArrayBaseline
+{
+    bool valid = false;
+    std::uint32_t generation = 0;
+    int arrayBuffer = 0;
+    int elementBuffer = 0;
+    int clientTexture = static_cast<int>(GL_TEXTURE0);
+};
+bool g_clientArrayProofScope = false;
+ClientArrayBaseline g_clientArrayBaseline{};
+// GL_MAX_TEXTURE_UNITS is a per-context constant.
+int g_arrayMaxTextureUnits = 0;
+std::uint32_t g_arrayMaxTextureUnitsGeneration = 0;
 unsigned g_studioVertexBuffer = 0;
 std::uint32_t g_studioVertexBufferGeneration = 0;
 unsigned g_gpuProgram = 0;
@@ -3271,42 +3290,81 @@ bool BeginArrayScopeRaw(const void* identity,
         !g_clientActiveTexture || !g_bindBuffer || !g_isEnabled)
         return false;
 
-    // Stock immediate mode ignores client arrays. glDrawArrays does not. Only
-    // enter the fast path when every unrelated core client array is proven
-    // disabled, including texcoord arrays on nonzero texture units. Otherwise
-    // replay stock immediate mode without modifying the foreign state.
-    if (g_isEnabled(GL_NORMAL_ARRAY) || g_isEnabled(GL_INDEX_ARRAY) ||
-        g_isEnabled(GL_EDGE_FLAG_ARRAY) || g_isEnabled(GL_FOG_COORDINATE_ARRAY) ||
-        g_isEnabled(GL_SECONDARY_COLOR_ARRAY))
+    const bool contextReady = worldvbo::ContextGenerationReady();
+    const std::uint32_t generation =
+        contextReady ? worldvbo::ContextGeneration() : 0u;
+    if (g_clientArrayProofScope && contextReady &&
+        g_clientArrayBaseline.valid &&
+        g_clientArrayBaseline.generation == generation)
     {
-        g_arrayScopeRejected = true;
-        return false;
+        g_previousArrayBuffer = g_clientArrayBaseline.arrayBuffer;
+        g_previousElementArrayBuffer = g_clientArrayBaseline.elementBuffer;
+        g_previousClientTexture = g_clientArrayBaseline.clientTexture;
     }
-
-    int checkClientTexture = static_cast<int>(GL_TEXTURE0);
-    int maxTextureUnits = 0;
-    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &checkClientTexture);
-    g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
-    if (maxTextureUnits < 1 || maxTextureUnits > 32)
+    else
     {
-        g_arrayScopeRejected = true;
-        return false;
-    }
-    for (int unit = 1; unit < maxTextureUnits; ++unit)
-    {
-        g_clientActiveTexture(GL_TEXTURE0 + static_cast<unsigned>(unit));
-        if (g_isEnabled(GL_TEXTURE_COORD_ARRAY))
+        g_clientArrayBaseline.valid = false;
+        // Stock immediate mode ignores client arrays. glDrawArrays does not.
+        // Only enter the fast path when every unrelated core client array is
+        // proven disabled, including texcoord arrays on nonzero texture units.
+        // Otherwise replay stock immediate mode without modifying the foreign
+        // state.
+        if (g_isEnabled(GL_NORMAL_ARRAY) || g_isEnabled(GL_INDEX_ARRAY) ||
+            g_isEnabled(GL_EDGE_FLAG_ARRAY) || g_isEnabled(GL_FOG_COORDINATE_ARRAY) ||
+            g_isEnabled(GL_SECONDARY_COLOR_ARRAY))
         {
-            g_clientActiveTexture(static_cast<unsigned>(checkClientTexture));
             g_arrayScopeRejected = true;
             return false;
         }
-    }
-    g_clientActiveTexture(static_cast<unsigned>(checkClientTexture));
 
-    g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &g_previousArrayBuffer);
-    g_getIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &g_previousElementArrayBuffer);
-    g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &g_previousClientTexture);
+        int checkClientTexture = static_cast<int>(GL_TEXTURE0);
+        g_getIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &checkClientTexture);
+        int maxTextureUnits = 0;
+        if (contextReady &&
+            g_arrayMaxTextureUnitsGeneration == generation &&
+            g_arrayMaxTextureUnits > 0)
+        {
+            maxTextureUnits = g_arrayMaxTextureUnits;
+        }
+        else
+        {
+            g_getIntegerv(GL_MAX_TEXTURE_UNITS, &maxTextureUnits);
+            if (maxTextureUnits < 1 || maxTextureUnits > 32)
+            {
+                g_arrayScopeRejected = true;
+                return false;
+            }
+            if (contextReady)
+            {
+                g_arrayMaxTextureUnits = maxTextureUnits;
+                g_arrayMaxTextureUnitsGeneration = generation;
+            }
+        }
+        for (int unit = 1; unit < maxTextureUnits; ++unit)
+        {
+            g_clientActiveTexture(GL_TEXTURE0 + static_cast<unsigned>(unit));
+            if (g_isEnabled(GL_TEXTURE_COORD_ARRAY))
+            {
+                g_clientActiveTexture(static_cast<unsigned>(checkClientTexture));
+                g_arrayScopeRejected = true;
+                return false;
+            }
+        }
+        g_clientActiveTexture(static_cast<unsigned>(checkClientTexture));
+
+        g_getIntegerv(GL_ARRAY_BUFFER_BINDING, &g_previousArrayBuffer);
+        g_getIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &g_previousElementArrayBuffer);
+        g_previousClientTexture = checkClientTexture;
+        if (g_clientArrayProofScope && contextReady)
+        {
+            g_clientArrayBaseline.valid = true;
+            g_clientArrayBaseline.generation = generation;
+            g_clientArrayBaseline.arrayBuffer = g_previousArrayBuffer;
+            g_clientArrayBaseline.elementBuffer = g_previousElementArrayBuffer;
+            g_clientArrayBaseline.clientTexture = g_previousClientTexture;
+        }
+    }
+
     g_pushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
     g_bindBuffer(GL_ARRAY_BUFFER, 0);
     g_bindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -5035,6 +5093,17 @@ void SetRetainedRendererActive(bool active)
     InterlockedExchange(
         &g_retainedRendererActive,
         active ? 1L : 0L);
+}
+
+void SetClientArrayProofScope(bool active)
+{
+    g_clientArrayProofScope = active;
+    g_clientArrayBaseline.valid = false;
+}
+
+void InvalidateClientArrayProof()
+{
+    g_clientArrayBaseline.valid = false;
 }
 
 bool RetainedDirectScopeAllowed()
